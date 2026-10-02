@@ -1,0 +1,73 @@
+cmake_minimum_required(VERSION 3.25)
+project(hyprauto VERSION 0.1.0 LANGUAGES C CXX)
+
+include(GNUInstallDirs)
+find_package(PkgConfig REQUIRED)
+pkg_check_modules(DEPS REQUIRED IMPORTED_TARGET xkbcommon wayland-server pixman-1 libdrm pangocairo libinput libudev nlohmann_json)
+
+set(HYPRLAND_SOURCE "" CACHE PATH "Matching configured Hyprland checkout, overriding installed headers")
+option(HYPRAUTO_BUILD_TESTS "Build the isolated headless integration harness" OFF)
+
+add_library(hyprland_headers INTERFACE)
+if(HYPRLAND_SOURCE)
+    get_filename_component(HYPRLAND_SOURCE "${HYPRLAND_SOURCE}" ABSOLUTE)
+    if(NOT EXISTS "${HYPRLAND_SOURCE}/src/version.h")
+        message(FATAL_ERROR "HYPRLAND_SOURCE must be a configured checkout with src/version.h")
+    endif()
+    pkg_check_modules(COMPOSITOR_DEPS REQUIRED IMPORTED_TARGET aquamarine hyprcursor hyprgraphics hyprlang hyprutils)
+    target_include_directories(hyprland_headers INTERFACE "${HYPRLAND_SOURCE}" "${HYPRLAND_SOURCE}/src" "${HYPRLAND_SOURCE}/protocols")
+    target_link_libraries(hyprland_headers INTERFACE PkgConfig::COMPOSITOR_DEPS)
+else()
+    pkg_check_modules(HYPRLAND REQUIRED IMPORTED_TARGET hyprland)
+    target_link_libraries(hyprland_headers INTERFACE PkgConfig::HYPRLAND)
+endif()
+target_link_libraries(hyprland_headers INTERFACE PkgConfig::DEPS)
+
+add_library(hyprauto MODULE src/main.cpp)
+set_target_properties(hyprauto PROPERTIES PREFIX "" CXX_STANDARD 23 CXX_STANDARD_REQUIRED YES)
+target_compile_definitions(hyprauto PRIVATE HYPRAUTO_VERSION="${PROJECT_VERSION}")
+target_compile_options(hyprauto PRIVATE -Wall -Wextra -Wno-unused-parameter -Wno-missing-field-initializers)
+target_link_libraries(hyprauto PRIVATE hyprland_headers)
+install(TARGETS hyprauto LIBRARY DESTINATION "${CMAKE_INSTALL_LIBDIR}/hyprland")
+
+configure_file(cmake/uninstall.cmake.in "${CMAKE_CURRENT_BINARY_DIR}/uninstall.cmake" @ONLY)
+add_custom_target(uninstall COMMAND "${CMAKE_COMMAND}" -P "${CMAKE_CURRENT_BINARY_DIR}/uninstall.cmake")
+
+if(HYPRAUTO_BUILD_TESTS)
+    if(NOT EXISTS "${HYPRLAND_SOURCE}/hyprtester/plugin/src/main.cpp")
+        message(FATAL_ERROR "Tests require HYPRLAND_SOURCE with the matching hyprtester plugin source")
+    endif()
+    enable_testing()
+    find_package(Python3 REQUIRED COMPONENTS Interpreter)
+    find_program(WAYLAND_SCANNER wayland-scanner REQUIRED)
+    find_program(BWRAP bwrap REQUIRED)
+    pkg_check_modules(CLIENT_DEPS REQUIRED IMPORTED_TARGET wayland-client xkbcommon)
+    pkg_check_modules(HEADLESS_DEPS REQUIRED IMPORTED_TARGET aquamarine libdrm pixman-1)
+    pkg_get_variable(WAYLAND_PROTOCOLS_DIR wayland-protocols pkgdatadir)
+    set(XDG_SHELL_XML "${WAYLAND_PROTOCOLS_DIR}/stable/xdg-shell/xdg-shell.xml")
+    add_custom_command(OUTPUT "${CMAKE_CURRENT_BINARY_DIR}/xdg-shell-client-protocol.h"
+        COMMAND "${WAYLAND_SCANNER}" client-header "${XDG_SHELL_XML}" "${CMAKE_CURRENT_BINARY_DIR}/xdg-shell-client-protocol.h"
+        DEPENDS "${XDG_SHELL_XML}")
+    add_custom_command(OUTPUT "${CMAKE_CURRENT_BINARY_DIR}/xdg-shell-protocol.c"
+        COMMAND "${WAYLAND_SCANNER}" private-code "${XDG_SHELL_XML}" "${CMAKE_CURRENT_BINARY_DIR}/xdg-shell-protocol.c"
+        DEPENDS "${XDG_SHELL_XML}")
+    add_executable(input-client tests/client.c "${CMAKE_CURRENT_BINARY_DIR}/xdg-shell-client-protocol.h" "${CMAKE_CURRENT_BINARY_DIR}/xdg-shell-protocol.c")
+    set_target_properties(input-client PROPERTIES C_STANDARD 11 C_STANDARD_REQUIRED YES)
+    target_include_directories(input-client PRIVATE "${CMAKE_CURRENT_BINARY_DIR}")
+    target_compile_options(input-client PRIVATE -Wall -Wextra -Wno-unused-parameter)
+    target_link_libraries(input-client PRIVATE PkgConfig::CLIENT_DEPS)
+
+    add_library(hyprtestplugin MODULE tests/test-support.cpp)
+    set_target_properties(hyprtestplugin PROPERTIES PREFIX "" CXX_STANDARD 23 CXX_STANDARD_REQUIRED YES)
+    target_compile_options(hyprtestplugin PRIVATE -Wno-narrowing)
+    target_link_libraries(hyprtestplugin PRIVATE hyprland_headers)
+
+    add_library(headless MODULE tests/headless.cpp)
+    set_target_properties(headless PROPERTIES PREFIX "" CXX_STANDARD 23 CXX_STANDARD_REQUIRED YES)
+    target_link_libraries(headless PRIVATE PkgConfig::HEADLESS_DEPS ${CMAKE_DL_LIBS})
+
+    set(HYPRAUTO_TEST_BINARY "${HYPRLAND_SOURCE}/build/Hyprland" CACHE FILEPATH "Matching Hyprland binary for headless tests")
+    add_test(NAME headless COMMAND "${Python3_EXECUTABLE}" "${CMAKE_CURRENT_SOURCE_DIR}/tests/test.py"
+        --binary "${HYPRAUTO_TEST_BINARY}" --build-dir "${CMAKE_CURRENT_BINARY_DIR}")
+    set_tests_properties(headless PROPERTIES TIMEOUT 120)
+endif()

@@ -1,0 +1,12 @@
+[repository]
+name = "hyprauto"
+authors = ["hyprauto contributors"]
+
+[hyprauto]
+description = "Independent background Wayland input sessions"
+authors = ["hyprauto contributors"]
+output = "build/hyprauto.so"
+build = [
+    "cmake -S . -B build -DCMAKE_BUILD_TYPE=Release -DHYPRAUTO_BUILD_TESTS=OFF",
+    "cmake --build build --target hyprauto -j2",
+]
