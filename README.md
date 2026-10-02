@@ -92,7 +92,7 @@ hyprctl hyprauto block-input off
 
 Blocking filters only user events sent to the target client's `wl_keyboard` and `wl_pointer` resources. It does not affect automation, other clients, host focus, physical cursor movement, or Hyprland key bindings. The policy resets when the session ends.
 
-A screenshot requires an active session and a target currently renderable by Hyprland. The PNG contains the target main-surface crop, not the full monitor or host cursor.
+A screenshot requires an active session and a target currently renderable by Hyprland. The PNG contains the target main-surface crop, not the full monitor or host cursor. Hyprland window opacity and decorations are excluded; alpha in the client surface itself is preserved.
 
 User and automation events share the target client's protocol resources; application-level state isolation is not guaranteed. Overlapping presses, releases, and interleaved events may affect the application, and users are responsible for the consequences. Toggling the block policy does not replay physical input state; release held user keys and buttons before changing it.
 

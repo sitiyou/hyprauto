@@ -267,8 +267,8 @@ def run(binary, build_dir, plugin):
             captured = command(f'/hyprauto screenshot "{screenshot}"')
             assert captured == "ok: 320x240 " + str(screenshot), captured
             assert png_size(screenshot) == (320, 240)
-            assert png_pixel(screenshot, 160, 120)[:3] == (48, 80, 112)
-            check("background target screenshot writes correctly cropped PNG pixels without changing host focus")
+            assert png_pixel(screenshot, 160, 120) == (48, 80, 112, 255)
+            check("background screenshot crops target pixels and ignores Hyprland window opacity")
             check("background session enters once without changing host focus or activation")
 
             auto("key 42 down")

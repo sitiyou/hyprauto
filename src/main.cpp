@@ -31,8 +31,10 @@ static bool                          automationDispatch = false;
 static std::vector<CFunctionHook*>   hooks;
 static SP<Hyprauto::Compat::Command> command;
 static CHyprSignalListener           windowClose;
-static CFunctionHook*                keymapHook = nullptr;
-static CFunctionHook*                repeatHook = nullptr;
+static CFunctionHook*                keymapHook              = nullptr;
+static CFunctionHook*                repeatHook              = nullptr;
+static CFunctionHook*                renderWindowHook        = nullptr;
+static bool                          captureStandaloneWindow = false;
 static CHyprSignalListener           hostCursorListener;
 static uint64_t                      hostCursorUpdates = 0;
 
@@ -105,6 +107,12 @@ static CFunctionHook* installHook(const std::string& name, void* destination) {
         throw std::runtime_error("Cannot hook " + name);
     hooks.push_back(hook);
     return hook;
+}
+
+static void renderWindowForCapture(Render::IHyprRenderer* self, PHLWINDOW window, PHLMONITOR monitor, const Time::steady_tp& time, bool decorate, Render::eRenderPassMode mode,
+                                   bool ignorePosition, bool standalone) {
+    using Original = void (*)(Render::IHyprRenderer*, PHLWINDOW, PHLMONITOR, const Time::steady_tp&, bool, Render::eRenderPassMode, bool, bool);
+    reinterpret_cast<Original>(renderWindowHook->m_original)(self, window, monitor, time, decorate, mode, ignorePosition, standalone || captureStandaloneWindow);
 }
 
 template <int ID, typename Resource, typename... Args>
@@ -292,7 +300,10 @@ static std::string captureWindow(const std::string& path) {
     if (!width || !height || width > 16384 || height > 16384 || static_cast<uint64_t>(width) * height > 67108864)
         return "error: framebuffer dimensions exceed capture limits";
 
-    auto framebuffer = g_pHyprRenderer->makeSnapshotFB(window);
+    const bool wasStandalone = captureStandaloneWindow;
+    captureStandaloneWindow  = true;
+    CScopeGuard restoreStandalone([&] { captureStandaloneWindow = wasStandalone; });
+    auto        framebuffer = g_pHyprRenderer->makeSnapshotFB(window);
     if (!framebuffer || !framebuffer->isAllocated() || framebuffer->m_size.x != width || framebuffer->m_size.y != height)
         return "error: target is not currently renderable";
 
@@ -463,9 +474,10 @@ APICALL EXPORT PLUGIN_DESCRIPTION_INFO PLUGIN_INIT(HANDLE pluginHandle) {
     Gate<12, CWLPointerResource, wl_pointer_axis, int32_t>::install("CWLPointerResource::sendAxisDiscrete");
     Gate<13, CWLPointerResource, wl_pointer_axis, int32_t>::install("CWLPointerResource::sendAxisValue120");
     Gate<14, CWLPointerResource, wl_pointer_axis, wl_pointer_axis_relative_direction>::install("CWLPointerResource::sendAxisRelativeDirection");
-    keymapHook = installHook("CWLSeatProtocol::updateKeymap", reinterpret_cast<void*>(&updateHostKeymaps));
-    repeatHook = installHook("CWLSeatProtocol::updateRepeatInfo", reinterpret_cast<void*>(&updateHostRepeatInfo));
-    command    = Hyprauto::Compat::registerCommand(handle, "hyprauto", dispatch);
+    keymapHook       = installHook("CWLSeatProtocol::updateKeymap", reinterpret_cast<void*>(&updateHostKeymaps));
+    repeatHook       = installHook("CWLSeatProtocol::updateRepeatInfo", reinterpret_cast<void*>(&updateHostRepeatInfo));
+    renderWindowHook = installHook("Render::IHyprRenderer::renderWindow", reinterpret_cast<void*>(&renderWindowForCapture));
+    command          = Hyprauto::Compat::registerCommand(handle, "hyprauto", dispatch);
     if (!command)
         throw std::runtime_error("Cannot register hyprauto command");
     hostCursorListener = g_pSeatManager->m_events.setCursor.listen([](const auto&) { ++hostCursorUpdates; });

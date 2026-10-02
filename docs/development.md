@@ -91,7 +91,7 @@ A session owns pressed-key/button sets, surface-local pointer coordinates and an
 
 Each session starts with `block_input: false`. `hyprauto block-input on|off` changes delivery policy during an active session without restarting it. End/unmap/disconnect reset the policy. A target may already have host focus when the session begins.
 
-`hyprauto screenshot <path>` renders a temporary Hyprland window snapshot, reads back only the target main-surface rectangle, and writes that crop as a PNG. Capture is synchronous and fails if the window is not currently renderable. The temporary readback buffer is bounded to 64 megapixels.
+`hyprauto screenshot <path>` renders a temporary standalone window snapshot, reads back only the target main-surface rectangle, and writes that crop as a PNG. The render hook forces Hyprland's standalone mode for this synchronous call, excluding window opacity and decorations while preserving alpha from the client surface. Capture fails if the window is not currently renderable. The temporary readback buffer is bounded to 64 megapixels.
 
 Delivery uses Hyprland's `CWLKeyboardResource` and `CWLPointerResource` methods. They retain responsibility for serials, button serial tracking, resource lifetime listeners, fixed-point coordinates, capability checks and protocol events. No custom Wayland keyboard/pointer implementation or seat-focus swap is introduced.
 
@@ -108,7 +108,7 @@ This is client-local protocol focus on the existing seat, not a second advertise
 
 End/unload releases held inputs, clears modifiers, sends leave/frame and restores the current host keymap/repeat settings. If host focus is on the target client, ordinary input routing is re-entered. Unmap/destruction cancels without re-entering closing surfaces.
 
-The single-session bypass flag assumes synchronous, single-threaded input dispatch. Concurrent sessions need per-client routing state. Session setup snapshots bound input resources; dynamic rebinding needs additional lifecycle handling. Popup/subsurface targeting, XWayland, IME, pointer constraints, relative-pointer delivery, drag-and-drop, touch and tablet input are outside the current scope. The block policy covers the hooked `wl_keyboard`/`wl_pointer` events, not these additional input protocols. Screenshot output is the visible rendered main-surface crop; it does not include the monitor or host cursor.
+The single-session bypass flag assumes synchronous, single-threaded input dispatch. Concurrent sessions need per-client routing state. Session setup snapshots bound input resources; dynamic rebinding needs additional lifecycle handling. Popup/subsurface targeting, XWayland, IME, pointer constraints, relative-pointer delivery, drag-and-drop, touch and tablet input are outside the current scope. The block policy covers the hooked `wl_keyboard`/`wl_pointer` events, not these additional input protocols. Screenshot output is the standalone-rendered main-surface crop; it does not include the monitor or host cursor, and it ignores Hyprland's window opacity.
 
 ## Backend choice
 
