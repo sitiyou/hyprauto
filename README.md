@@ -61,6 +61,7 @@ hyprctl hyprauto key 30 up
 hyprctl hyprauto key 42 up
 hyprctl hyprauto button 272 down
 hyprctl hyprauto button 272 up
+hyprctl hyprauto screenshot "$HOME/Pictures/target.png"
 hyprctl hyprauto status
 hyprctl hyprauto end
 ```
@@ -71,6 +72,7 @@ hyprctl hyprauto end
 | `key <code> down\|up` | Press or release a Linux evdev key code. |
 | `move <x> <y>` | Move the automation pointer in coordinates relative to the target's main surface. |
 | `button <code> down\|up` | Press or release a mouse button. |
+| `screenshot <path>` | Save the target's rendered main surface as a PNG; quote paths containing spaces. |
 | `block-input on\|off` | Block or allow user keyboard and pointer events to the target during an active session. |
 | `status` | Return session and host input state as JSON, including `block_input`. |
 | `end` | Release automation input and end the session; safe to call repeatedly. |
@@ -89,6 +91,8 @@ hyprctl hyprauto block-input off
 ```
 
 Blocking filters only user events sent to the target client's `wl_keyboard` and `wl_pointer` resources. It does not affect automation, other clients, host focus, physical cursor movement, or Hyprland key bindings. The policy resets when the session ends.
+
+A screenshot requires an active session and a target currently renderable by Hyprland. The PNG contains the target main-surface crop, not the full monitor or host cursor.
 
 User and automation events share the target client's protocol resources; application-level state isolation is not guaranteed. Overlapping presses, releases, and interleaved events may affect the application, and users are responsible for the consequences. Toggling the block policy does not replay physical input state; release held user keys and buttons before changing it.
 

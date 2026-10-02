@@ -1,15 +1,68 @@
 import argparse
 import json
 import os
-from pathlib import Path
-import socket
 import shutil
+import socket
+import struct
 import subprocess
 import tempfile
 import threading
 import time
+import zlib
+from pathlib import Path
 
 TESTS = Path(__file__).resolve().parent
+
+
+def png_pixel(path, x, y):
+    data = path.read_bytes()
+    assert data.startswith(b"\x89PNG\r\n\x1a\n")
+    width, height, depth, color, _, _, _ = struct.unpack(">IIBBBBB", data[16:29])
+    assert depth == 8 and color in (2, 6) and 0 <= x < width and 0 <= y < height
+    channels = 4 if color == 6 else 3
+    compressed = bytearray()
+    offset = 8
+    while offset < len(data):
+        length = struct.unpack(">I", data[offset:offset + 4])[0]
+        kind = data[offset + 4:offset + 8]
+        if kind == b"IDAT":
+            compressed.extend(data[offset + 8:offset + 8 + length])
+        offset += length + 12
+    raw = zlib.decompress(compressed)
+    stride = width * channels
+    previous = bytearray(stride)
+    for row_index in range(height):
+        start = row_index * (stride + 1)
+        filt = raw[start]
+        row = bytearray(raw[start + 1:start + stride + 1])
+        for index in range(stride):
+            left = row[index - channels] if index >= channels else 0
+            above = previous[index]
+            upper_left = previous[index - channels] if index >= channels else 0
+            if filt == 1:
+                row[index] = (row[index] + left) & 255
+            elif filt == 2:
+                row[index] = (row[index] + above) & 255
+            elif filt == 3:
+                row[index] = (row[index] + (left + above) // 2) & 255
+            elif filt == 4:
+                estimate = left + above - upper_left
+                distances = (abs(estimate - left), abs(estimate - above), abs(estimate - upper_left))
+                predictor = (left, above, upper_left)[distances.index(min(distances))]
+                row[index] = (row[index] + predictor) & 255
+            else:
+                assert filt == 0
+        if row_index == y:
+            pixel = tuple(row[x * channels:x * channels + channels])
+            return pixel + ((255,) if channels == 3 else ())
+        previous = row
+    raise AssertionError("PNG row is missing")
+
+
+def png_size(path):
+    data = path.read_bytes()
+    assert data.startswith(b"\x89PNG\r\n\x1a\n")
+    return struct.unpack(">II", data[16:24])
 
 
 def wait_for(predicate, description, timeout=15):
@@ -210,6 +263,12 @@ def run(binary, build_dir, plugin):
             assert events.count("keyboard-enter") == 1, events
             assert "pointer-enter 1.000 1.000" in events, events
             assert "active 1" not in events, events
+            screenshot = runtime / "target capture.png"
+            captured = command(f'/hyprauto screenshot "{screenshot}"')
+            assert captured == "ok: 320x240 " + str(screenshot), captured
+            assert png_size(screenshot) == (320, 240)
+            assert png_pixel(screenshot, 160, 120)[:3] == (48, 80, 112)
+            check("background target screenshot writes correctly cropped PNG pixels without changing host focus")
             check("background session enters once without changing host focus or activation")
 
             auto("key 42 down")
@@ -381,7 +440,7 @@ def run(binary, build_dir, plugin):
             check("ending a blocked foreground session restores ordinary host routing")
 
             for request in ("key 30 up", "button 272 up", "key -1 down", "button 1 down", "move -1 10", "move 999999 10",
-                            "block-input", "block-input yes", "block-input on extra"):
+                            "block-input", "block-input yes", "block-input on extra", "screenshot", "screenshot one two"):
                 assert command("/hyprauto " + request).startswith("error:"), request
             auto("key 30 down")
             assert command("/hyprauto key 30 down").startswith("error:")

@@ -4,6 +4,11 @@
 #include <src/managers/SeatManager.hpp>
 #include <src/managers/input/InputManager.hpp>
 #include <src/desktop/state/ViewState.hpp>
+#include <src/output/Monitor.hpp>
+#include <src/render/Renderer.hpp>
+#include <src/protocols/types/Buffer.hpp>
+#include <hyprutils/math/Box.hpp>
+#include <cairo/cairo.h>
 #include <src/desktop/state/ViewQuery.hpp>
 #include <src/desktop/state/FocusState.hpp>
 #include <src/devices/IKeyboard.hpp>
@@ -12,6 +17,8 @@
 #include <nlohmann/json.hpp>
 #include <linux/input-event-codes.h>
 #include <cmath>
+#include <format>
+#include <iomanip>
 #include <set>
 #include <sstream>
 #include <stdexcept>
@@ -42,7 +49,47 @@ struct Session {
     CHyprSignalListener                  surfaceDestroy;
 };
 
-static Session  session;
+static Session session;
+
+class CaptureBuffer : public IHLBuffer {
+  public:
+    CaptureBuffer(uint32_t width, uint32_t height) : pixels(static_cast<size_t>(width) * height * 4), stride(width * 4) {
+        size = {static_cast<double>(width), static_cast<double>(height)};
+    }
+
+    Aquamarine::eBufferCapability caps() override {
+        return Aquamarine::BUFFER_CAPABILITY_DATAPTR;
+    }
+
+    Aquamarine::eBufferType type() override {
+        return Aquamarine::BUFFER_TYPE_SHM;
+    }
+
+    void update(const CRegion&) override {}
+
+    bool isSynchronous() override {
+        return true;
+    }
+
+    bool good() override {
+        return !pixels.empty();
+    }
+
+    void                  sendRelease() override {}
+
+    Aquamarine::SSHMAttrs shm() override {
+        return {.success = true, .fd = -1, .format = DRM_FORMAT_ARGB8888, .size = size, .stride = sc<int>(stride), .offset = 0};
+    }
+
+    std::tuple<uint8_t*, uint32_t, size_t> beginDataPtr(uint32_t) override {
+        return {pixels.data(), DRM_FORMAT_ARGB8888, pixels.size()};
+    }
+
+    void                 endDataPtr() override {}
+
+    std::vector<uint8_t> pixels;
+    uint32_t             stride;
+};
 
 static uint32_t now() {
     return static_cast<uint32_t>(Time::millis(Time::steadyNow()));
@@ -233,6 +280,50 @@ static std::string beginSession(const std::string& selector) {
     return "ok";
 }
 
+static std::string captureWindow(const std::string& path) {
+    auto window  = session.window.lock();
+    auto monitor = window ? window->m_monitor.lock() : nullptr;
+    if (!window || !monitor)
+        return "error: session target is unavailable";
+    auto       targetBox = window->getWindowMainSurfaceBox();
+
+    const auto width  = static_cast<uint32_t>(monitor->m_transformedSize.x);
+    const auto height = static_cast<uint32_t>(monitor->m_transformedSize.y);
+    if (!width || !height || width > 16384 || height > 16384 || static_cast<uint64_t>(width) * height > 67108864)
+        return "error: framebuffer dimensions exceed capture limits";
+
+    auto framebuffer = g_pHyprRenderer->makeSnapshotFB(window);
+    if (!framebuffer || !framebuffer->isAllocated() || framebuffer->m_size.x != width || framebuffer->m_size.y != height)
+        return "error: target is not currently renderable";
+
+    auto box = targetBox.translate(-monitor->m_position);
+    box.transform(Math::wlTransformToHyprutils(Math::invertTransform(monitor->m_transform)), monitor->m_transformedSize.x / monitor->m_scale,
+                  monitor->m_transformedSize.y / monitor->m_scale)
+        .scale(monitor->m_scale);
+    const auto left   = std::clamp(static_cast<int>(std::floor(box.x)), 0, static_cast<int>(width));
+    const auto top    = std::clamp(static_cast<int>(std::floor(box.y)), 0, static_cast<int>(height));
+    const auto right  = std::clamp(static_cast<int>(std::ceil(box.x + box.w)), 0, static_cast<int>(width));
+    const auto bottom = std::clamp(static_cast<int>(std::ceil(box.y + box.h)), 0, static_cast<int>(height));
+    if (right <= left || bottom <= top)
+        return "error: target surface has no visible pixels";
+
+    auto buffer = makeShared<CaptureBuffer>(width, height);
+    if (!framebuffer->readPixels(CHLBufferReference(buffer), left, top, right - left, bottom - top))
+        return "error: failed to read target pixels";
+
+    auto* data  = buffer->pixels.data() + static_cast<size_t>(top) * buffer->stride + static_cast<size_t>(left) * 4;
+    auto* image = cairo_image_surface_create_for_data(data, CAIRO_FORMAT_ARGB32, right - left, bottom - top, buffer->stride);
+    if (cairo_surface_status(image) != CAIRO_STATUS_SUCCESS) {
+        cairo_surface_destroy(image);
+        return "error: cannot create PNG image";
+    }
+    const auto result = cairo_surface_write_to_png(image, path.c_str());
+    cairo_surface_destroy(image);
+    if (result != CAIRO_STATUS_SUCCESS)
+        return "error: cannot write PNG file";
+    return std::format("ok: {}x{} {}", right - left, bottom - top, path);
+}
+
 static uint32_t surfaceID(const WP<CWLSurfaceResource>& surface) {
     return surface ? wl_resource_get_id(surface->getResource()->resource()) : 0;
 }
@@ -283,6 +374,15 @@ static std::string dispatch(const std::string& request) {
     }
     if (!session.client || !session.surface)
         return "error: no active session";
+    if (operation == "screenshot") {
+        std::string path;
+        if (!(input >> std::quoted(path)) || path.empty())
+            return "error: screenshot requires an output path";
+        std::string extra;
+        if (input >> extra)
+            return "error: screenshot accepts one output path";
+        return captureWindow(path);
+    }
     if (operation == "block-input") {
         std::string mode, extra;
         if (!(input >> mode) || input >> extra || (mode != "on" && mode != "off"))
@@ -337,7 +437,7 @@ static std::string dispatch(const std::string& request) {
         }
         return "ok";
     }
-    return "error: use begin, key, move, button, block-input, end or status";
+    return "error: use begin, key, move, button, screenshot, block-input, end or status";
 }
 
 APICALL EXPORT std::string PLUGIN_API_VERSION() {

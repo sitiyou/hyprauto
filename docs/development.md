@@ -78,7 +78,8 @@ Bubblewrap gives the compositor a private PID namespace, `/dev` and `/run`, with
 12. Invalid input, malformed block modes, unmatched releases, duplicate presses and out-of-bounds coordinates are rejected; ending releases held inputs.
 13. Target unmap releases inputs and cancels the session.
 14. Target disconnect cancels the session without breaking compositor or host input.
-15. Unload/reload restores ordinary routing; sessions can begin on a foreground target with coexistence enabled.
+15. A background target can be cropped to a PNG without changing host focus; the image dimensions and pixel content match the target surface.
+16. Unload/reload restores ordinary routing; sessions can begin on a foreground target with coexistence enabled.
 
 The suite has been validated against Hyprland 0.56.2 (`efb50993780079460b0cbed1363e2166a2de1d9f`) and `41a5d15ac07b3729eda6d26e629f027ab69ed4d9`, using GCC, Aquamarine 0.15.1 and Hyprutils 0.14.2. These are protocol-level tests, not application compatibility tests.
 
@@ -89,6 +90,8 @@ The suite has been validated against Hyprland 0.56.2 (`efb50993780079460b0cbed13
 A session owns pressed-key/button sets, surface-local pointer coordinates and an independent `xkb_state` initialized from the active keyboard's keymap. The keymap is a snapshot for the session lifetime. Host input does not update these automation models. Before injecting a key, the session reapplies its modifiers; before injecting a button, it sends its stored pointer position.
 
 Each session starts with `block_input: false`. `hyprauto block-input on|off` changes delivery policy during an active session without restarting it. End/unmap/disconnect reset the policy. A target may already have host focus when the session begins.
+
+`hyprauto screenshot <path>` renders a temporary Hyprland window snapshot, reads back only the target main-surface rectangle, and writes that crop as a PNG. Capture is synchronous and fails if the window is not currently renderable. The temporary readback buffer is bounded to 64 megapixels.
 
 Delivery uses Hyprland's `CWLKeyboardResource` and `CWLPointerResource` methods. They retain responsibility for serials, button serial tracking, resource lifetime listeners, fixed-point coordinates, capability checks and protocol events. No custom Wayland keyboard/pointer implementation or seat-focus swap is introduced.
 
@@ -105,7 +108,7 @@ This is client-local protocol focus on the existing seat, not a second advertise
 
 End/unload releases held inputs, clears modifiers, sends leave/frame and restores the current host keymap/repeat settings. If host focus is on the target client, ordinary input routing is re-entered. Unmap/destruction cancels without re-entering closing surfaces.
 
-The single-session bypass flag assumes synchronous, single-threaded input dispatch. Concurrent sessions need per-client routing state. Session setup snapshots bound input resources; dynamic rebinding needs additional lifecycle handling. Popup/subsurface targeting, XWayland, IME, pointer constraints, relative-pointer delivery, drag-and-drop, touch and tablet input are outside the current scope. The block policy covers the hooked `wl_keyboard`/`wl_pointer` events, not these additional input protocols.
+The single-session bypass flag assumes synchronous, single-threaded input dispatch. Concurrent sessions need per-client routing state. Session setup snapshots bound input resources; dynamic rebinding needs additional lifecycle handling. Popup/subsurface targeting, XWayland, IME, pointer constraints, relative-pointer delivery, drag-and-drop, touch and tablet input are outside the current scope. The block policy covers the hooked `wl_keyboard`/`wl_pointer` events, not these additional input protocols. Screenshot output is the visible rendered main-surface crop; it does not include the monitor or host cursor.
 
 ## Backend choice
 
