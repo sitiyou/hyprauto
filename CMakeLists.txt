@@ -27,7 +27,7 @@ target_link_libraries(hyprland_headers INTERFACE PkgConfig::DEPS)
 add_library(hyprauto MODULE src/main.cpp src/capture.cpp src/socket.cpp)
 set_target_properties(hyprauto PROPERTIES PREFIX "" CXX_STANDARD 23 CXX_STANDARD_REQUIRED YES)
 target_compile_definitions(hyprauto PRIVATE HYPRAUTO_VERSION="${PROJECT_VERSION}")
-target_compile_options(hyprauto PRIVATE -Wall -Wextra -Wno-unused-parameter -Wno-missing-field-initializers)
+target_compile_options(hyprauto PRIVATE -Wall -Wextra -Wno-unused-parameter -Wno-missing-field-initializers -fno-access-control)
 target_link_libraries(hyprauto PRIVATE hyprland_headers Threads::Threads)
 install(TARGETS hyprauto LIBRARY DESTINATION "${CMAKE_INSTALL_LIBDIR}/hyprland")
 
@@ -45,14 +45,19 @@ if(HYPRAUTO_BUILD_TESTS)
     pkg_check_modules(CLIENT_DEPS REQUIRED IMPORTED_TARGET wayland-client xkbcommon)
     pkg_check_modules(HEADLESS_DEPS REQUIRED IMPORTED_TARGET aquamarine libdrm pixman-1)
     pkg_get_variable(WAYLAND_PROTOCOLS_DIR wayland-protocols pkgdatadir)
-    set(XDG_SHELL_XML "${WAYLAND_PROTOCOLS_DIR}/stable/xdg-shell/xdg-shell.xml")
-    add_custom_command(OUTPUT "${CMAKE_CURRENT_BINARY_DIR}/xdg-shell-client-protocol.h"
-        COMMAND "${WAYLAND_SCANNER}" client-header "${XDG_SHELL_XML}" "${CMAKE_CURRENT_BINARY_DIR}/xdg-shell-client-protocol.h"
-        DEPENDS "${XDG_SHELL_XML}")
-    add_custom_command(OUTPUT "${CMAKE_CURRENT_BINARY_DIR}/xdg-shell-protocol.c"
-        COMMAND "${WAYLAND_SCANNER}" private-code "${XDG_SHELL_XML}" "${CMAKE_CURRENT_BINARY_DIR}/xdg-shell-protocol.c"
-        DEPENDS "${XDG_SHELL_XML}")
-    add_executable(input-client tests/client.c "${CMAKE_CURRENT_BINARY_DIR}/xdg-shell-client-protocol.h" "${CMAKE_CURRENT_BINARY_DIR}/xdg-shell-protocol.c")
+    set(CLIENT_PROTOCOLS)
+    foreach(PROTOCOL stable/xdg-shell/xdg-shell staging/cursor-shape/cursor-shape-v1 stable/tablet/tablet-v2)
+        get_filename_component(NAME "${PROTOCOL}" NAME)
+        set(XML "${WAYLAND_PROTOCOLS_DIR}/${PROTOCOL}.xml")
+        set(HEADER "${CMAKE_CURRENT_BINARY_DIR}/${NAME}-client-protocol.h")
+        set(CODE "${CMAKE_CURRENT_BINARY_DIR}/${NAME}-protocol.c")
+        add_custom_command(OUTPUT "${HEADER}" "${CODE}"
+            COMMAND "${WAYLAND_SCANNER}" client-header "${XML}" "${HEADER}"
+            COMMAND "${WAYLAND_SCANNER}" private-code "${XML}" "${CODE}"
+            DEPENDS "${XML}")
+        list(APPEND CLIENT_PROTOCOLS "${HEADER}" "${CODE}")
+    endforeach()
+    add_executable(input-client tests/client.c ${CLIENT_PROTOCOLS})
     set_target_properties(input-client PROPERTIES C_STANDARD 11 C_STANDARD_REQUIRED YES)
     target_include_directories(input-client PRIVATE "${CMAKE_CURRENT_BINARY_DIR}")
     target_compile_options(input-client PRIVATE -Wall -Wextra -Wno-unused-parameter)

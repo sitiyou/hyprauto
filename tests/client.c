@@ -2,6 +2,7 @@
 #include <wayland-client.h>
 #include <xkbcommon/xkbcommon.h>
 #include "xdg-shell-client-protocol.h"
+#include "cursor-shape-v1-client-protocol.h"
 #include <poll.h>
 #include <sys/mman.h>
 #include <unistd.h>
@@ -20,7 +21,17 @@ static struct xkb_context*   context;
 static struct xkb_keymap*    keymap;
 static struct xkb_state*     state;
 static int                   width = 320, height = 240, running = 1;
-static uint32_t              cursor_serial;
+static struct wp_cursor_shape_manager_v1* shape_manager;
+static struct wl_surface*                 other_surface;
+static struct xdg_surface*                other_xsurface;
+static struct xdg_toplevel*               other_top;
+static struct wl_keyboard*                keyboards[2];
+static struct wl_surface*                 keyboard_surfaces[2];
+static struct wl_pointer*                 pointers[2];
+static struct wl_surface*                 pointer_surfaces[2];
+static uint32_t                           cursor_serials[2];
+static struct wp_cursor_shape_device_v1*  shapes[2];
+static int                                input_count;
 
 static void                  buffer_release(void* data, struct wl_buffer* buffer) {
     wl_buffer_destroy(buffer);
@@ -51,9 +62,10 @@ static void                            configure_surface(void* data, struct xdg_
     wl_shm_pool_destroy(pool);
     munmap(pixels, size);
     close(fd);
-    wl_surface_attach(surface, buffer, 0, 0);
-    wl_surface_damage_buffer(surface, 0, 0, width, height);
-    wl_surface_commit(surface);
+    struct wl_surface* configured = xdg == other_xsurface ? other_surface : surface;
+    wl_surface_attach(configured, buffer, 0, 0);
+    wl_surface_damage_buffer(configured, 0, 0, width, height);
+    wl_surface_commit(configured);
     printf("configured %d %d\n", width, height);
 }
 static const struct xdg_surface_listener surface_listener = {configure_surface};
@@ -99,7 +111,10 @@ static void                              keyboard_keymap(void* data, struct wl_k
     puts("keymap");
 }
 static void keyboard_enter(void* data, struct wl_keyboard* keyboard, uint32_t serial, struct wl_surface* surf, struct wl_array* keys) {
-    printf("keyboard-enter");
+    for (int i = 0; i < input_count; ++i)
+        if (keyboards[i] == keyboard)
+            keyboard_surfaces[i] = surf;
+    printf("keyboard-enter%s", surf == other_surface ? "-other" : "");
     uint32_t* key;
     wl_array_for_each(key, keys) printf(" %u", *key);
     puts("");
@@ -108,7 +123,11 @@ static void keyboard_leave(void* data, struct wl_keyboard* keyboard, uint32_t se
     puts("keyboard-leave");
 }
 static void keyboard_key(void* data, struct wl_keyboard* keyboard, uint32_t serial, uint32_t time, uint32_t key, uint32_t pressed) {
-    printf("key %u %u %u\n", key, pressed, state ? xkb_state_key_get_one_sym(state, key + 8) : 0);
+    int other = 0;
+    for (int i = 0; i < input_count; ++i)
+        if (keyboards[i] == keyboard)
+            other = keyboard_surfaces[i] == other_surface;
+    printf("%skey %u %u %u\n", other ? "other-" : "", key, pressed, state ? xkb_state_key_get_one_sym(state, key + 8) : 0);
 }
 static void keyboard_modifiers(void* data, struct wl_keyboard* keyboard, uint32_t serial, uint32_t depressed, uint32_t latched, uint32_t locked, uint32_t group) {
     if (state)
@@ -121,18 +140,30 @@ static const struct wl_keyboard_listener keyboard_listener = {
 };
 
 static void pointer_enter(void* data, struct wl_pointer* pointer, uint32_t serial, struct wl_surface* surf, wl_fixed_t x, wl_fixed_t y) {
-    printf("pointer-enter %.3f %.3f\n", wl_fixed_to_double(x), wl_fixed_to_double(y));
-    cursor_serial = serial;
+    for (int i = 0; i < input_count; ++i)
+        if (pointers[i] == pointer) {
+            cursor_serials[i]   = serial;
+            pointer_surfaces[i] = surf;
+        }
+    printf("pointer-enter%s %.3f %.3f\n", surf == other_surface ? "-other" : "", wl_fixed_to_double(x), wl_fixed_to_double(y));
     wl_pointer_set_cursor(pointer, serial, NULL, 0, 0);
 }
 static void pointer_leave(void* data, struct wl_pointer* pointer, uint32_t serial, struct wl_surface* surf) {
     puts("pointer-leave");
 }
 static void pointer_motion(void* data, struct wl_pointer* pointer, uint32_t time, wl_fixed_t x, wl_fixed_t y) {
-    printf("motion %.3f %.3f\n", wl_fixed_to_double(x), wl_fixed_to_double(y));
+    int other = 0;
+    for (int i = 0; i < input_count; ++i)
+        if (pointers[i] == pointer)
+            other = pointer_surfaces[i] == other_surface;
+    printf("%smotion %.3f %.3f\n", other ? "other-" : "", wl_fixed_to_double(x), wl_fixed_to_double(y));
 }
 static void pointer_button(void* data, struct wl_pointer* pointer, uint32_t serial, uint32_t time, uint32_t button, uint32_t pressed) {
-    printf("button %u %u\n", button, pressed);
+    int other = 0;
+    for (int i = 0; i < input_count; ++i)
+        if (pointers[i] == pointer)
+            other = pointer_surfaces[i] == other_surface;
+    printf("%sbutton %u %u\n", other ? "other-" : "", button, pressed);
 }
 static void pointer_axis(void* data, struct wl_pointer* pointer, uint32_t time, uint32_t axis, wl_fixed_t value) {
     printf("axis %u %.3f\n", axis, wl_fixed_to_double(value));
@@ -170,6 +201,8 @@ static void                          global(void* data, struct wl_registry* regi
     else if (!strcmp(interface, "wl_seat")) {
         seat = wl_registry_bind(registry, name, &wl_seat_interface, version < 9 ? version : 9);
         wl_seat_add_listener(seat, &seat_listener, NULL);
+    } else if (!strcmp(interface, "wp_cursor_shape_manager_v1")) {
+        shape_manager = wl_registry_bind(registry, name, &wp_cursor_shape_manager_v1_interface, 1);
     } else if (!strcmp(interface, "xdg_wm_base")) {
         shell = wl_registry_bind(registry, name, &xdg_wm_base_interface, 1);
         xdg_wm_base_add_listener(shell, &shell_listener, NULL);
@@ -177,6 +210,16 @@ static void                          global(void* data, struct wl_registry* regi
 }
 static void                              global_remove(void* data, struct wl_registry* registry, uint32_t name) {}
 static const struct wl_registry_listener registry_listener = {global, global_remove};
+
+static void                              bind_input(void) {
+    int i        = input_count++;
+    keyboards[i] = wl_seat_get_keyboard(seat);
+    wl_keyboard_add_listener(keyboards[i], &keyboard_listener, NULL);
+    pointers[i] = wl_seat_get_pointer(seat);
+    wl_pointer_add_listener(pointers[i], &pointer_listener, NULL);
+    if (shape_manager)
+        shapes[i] = wp_cursor_shape_manager_v1_get_pointer(shape_manager, pointers[i]);
+}
 
 int                                      main(int argc, char** argv) {
     if (argc != 2)
@@ -190,10 +233,7 @@ int                                      main(int argc, char** argv) {
     wl_registry_add_listener(registry, &registry_listener, NULL);
     if (wl_display_roundtrip(display) < 0 || !compositor || !shm || !seat || !shell)
         return 2;
-    struct wl_keyboard* keyboard = wl_seat_get_keyboard(seat);
-    wl_keyboard_add_listener(keyboard, &keyboard_listener, NULL);
-    struct wl_pointer* pointer = wl_seat_get_pointer(seat);
-    wl_pointer_add_listener(pointer, &pointer_listener, NULL);
+    bind_input();
     surface  = wl_compositor_create_surface(compositor);
     xsurface = xdg_wm_base_get_xdg_surface(shell, surface);
     xdg_surface_add_listener(xsurface, &surface_listener, NULL);
@@ -238,11 +278,63 @@ int                                      main(int argc, char** argv) {
                 if (wl_display_roundtrip(display) < 0)
                     break;
                 puts("unmapped");
+            } else if (!strncmp(request, "cross-shape", 11) && input_count == 2) {
+                wp_cursor_shape_device_v1_set_shape(shapes[1], cursor_serials[0], WP_CURSOR_SHAPE_DEVICE_V1_SHAPE_TEXT);
+                if (wl_display_roundtrip(display) < 0)
+                    break;
+                puts("cross-shape-set");
+            } else if (!strncmp(request, "shape", 5)) {
+                if (!shapes[0])
+                    exit(2);
+                for (int i = 0; i < input_count; ++i)
+                    wp_cursor_shape_device_v1_set_shape(shapes[i], cursor_serials[i], WP_CURSOR_SHAPE_DEVICE_V1_SHAPE_TEXT);
+                if (wl_display_roundtrip(display) < 0)
+                    break;
+                puts("shape-set");
+            } else if (!strncmp(request, "stale-cursor", 12)) {
+                wl_pointer_set_cursor(pointers[0], cursor_serials[0] - 1, NULL, 0, 0);
+                wp_cursor_shape_device_v1_set_shape(shapes[0], cursor_serials[0] - 1, WP_CURSOR_SHAPE_DEVICE_V1_SHAPE_TEXT);
+                if (wl_display_roundtrip(display) < 0)
+                    break;
+                puts("stale-cursor-set");
             } else if (!strncmp(request, "cursor", 6)) {
-                wl_pointer_set_cursor(pointer, cursor_serial, NULL, 0, 0);
+                for (int i = 0; i < input_count; ++i)
+                    wl_pointer_set_cursor(pointers[i], cursor_serials[i], NULL, 0, 0);
                 if (wl_display_roundtrip(display) < 0)
                     break;
                 puts("cursor-set");
+            } else if (!strncmp(request, "bind", 4) && input_count == 1) {
+                bind_input();
+                if (wl_display_roundtrip(display) < 0)
+                    break;
+                puts("bound");
+            } else if (!strncmp(request, "unbind", 6) && input_count == 2) {
+                wp_cursor_shape_device_v1_destroy(shapes[1]);
+                wl_pointer_release(pointers[1]);
+                wl_keyboard_release(keyboards[1]);
+                input_count = 1;
+                if (wl_display_roundtrip(display) < 0)
+                    break;
+                puts("unbound");
+            } else if (!strncmp(request, "window", 6) && !other_surface) {
+                other_surface  = wl_compositor_create_surface(compositor);
+                other_xsurface = xdg_wm_base_get_xdg_surface(shell, other_surface);
+                xdg_surface_add_listener(other_xsurface, &surface_listener, NULL);
+                other_top = xdg_surface_get_toplevel(other_xsurface);
+                xdg_toplevel_add_listener(other_top, &toplevel_listener, NULL);
+                xdg_toplevel_set_app_id(other_top, "target-other");
+                wl_surface_commit(other_surface);
+                if (wl_display_roundtrip(display) < 0)
+                    break;
+                puts("window-created");
+            } else if (!strncmp(request, "close-window", 12) && other_surface) {
+                xdg_toplevel_destroy(other_top);
+                xdg_surface_destroy(other_xsurface);
+                wl_surface_destroy(other_surface);
+                other_surface = NULL;
+                if (wl_display_roundtrip(display) < 0)
+                    break;
+                puts("window-closed");
             } else if (!strncmp(request, "quit", 4))
                 break;
         }
@@ -253,8 +345,19 @@ done:
     xdg_toplevel_destroy(top);
     xdg_surface_destroy(xsurface);
     wl_surface_destroy(surface);
-    wl_pointer_release(pointer);
-    wl_keyboard_release(keyboard);
+    if (other_surface) {
+        xdg_toplevel_destroy(other_top);
+        xdg_surface_destroy(other_xsurface);
+        wl_surface_destroy(other_surface);
+    }
+    for (int i = 0; i < input_count; ++i) {
+        if (shapes[i])
+            wp_cursor_shape_device_v1_destroy(shapes[i]);
+        wl_pointer_release(pointers[i]);
+        wl_keyboard_release(keyboards[i]);
+    }
+    if (shape_manager)
+        wp_cursor_shape_manager_v1_destroy(shape_manager);
     wl_seat_release(seat);
     xdg_wm_base_destroy(shell);
     wl_shm_destroy(shm);

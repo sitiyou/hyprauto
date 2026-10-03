@@ -2,13 +2,17 @@
 #include "Capture.hpp"
 #include "Socket.hpp"
 #include <src/Compositor.hpp>
+#include <src/debug/log/Logger.hpp>
 #include <map>
 #include <algorithm>
 #include <src/protocols/core/Seat.hpp>
+#include <src/protocols/CursorShape.hpp>
+#include <src/helpers/CursorShapes.hpp>
 #include <src/protocols/core/Compositor.hpp>
 #include <src/managers/SeatManager.hpp>
 #include <src/managers/input/InputManager.hpp>
 #include <src/desktop/state/ViewState.hpp>
+#include <src/desktop/view/WLSurface.hpp>
 #include <src/output/Monitor.hpp>
 #include <hyprutils/math/Box.hpp>
 #include <src/desktop/state/ViewQuery.hpp>
@@ -25,6 +29,7 @@
 #include <sstream>
 #include <stdexcept>
 #include <type_traits>
+#include <tuple>
 
 using Hyprutils::Utils::CScopeGuard;
 
@@ -33,24 +38,56 @@ static bool                          automationDispatch = false;
 static std::vector<CFunctionHook*>   hooks;
 static SP<Hyprauto::Compat::Command> command;
 static CHyprSignalListener           windowClose;
-static CFunctionHook*                keymapHook = nullptr;
-static CFunctionHook*                repeatHook = nullptr;
-static CHyprSignalListener           hostCursorListener;
-static uint64_t                      hostCursorUpdates = 0;
+static CFunctionHook*                keymapHook       = nullptr;
+static CFunctionHook*                repeatHook       = nullptr;
+static CFunctionHook*                setCursorHook    = nullptr;
+static CFunctionHook*                pointerEnterHook = nullptr;
+static CFunctionHook*                shapePointerHook = nullptr;
+static CFunctionHook*                setShapeHook     = nullptr;
+struct ShapePointer {
+    wl_listener            destroy;
+    wl_resource*           resource;
+    WP<CWLPointerResource> pointer;
+
+    ~ShapePointer() {
+        wl_list_remove(&destroy.link);
+    }
+};
+static_assert(std::is_standard_layout_v<ShapePointer>);
+static std::map<wl_resource*, std::unique_ptr<ShapePointer>> shapePointers;
+static CHyprSignalListener                                   hostCursorListener;
+static CHyprSignalListener                                   pointerFocusListener;
+static CHyprSignalListener                                   cursorShapeListener;
+static uint64_t                                              hostCursorUpdates = 0;
+
+template <typename Resource>
+struct InputBinding {
+    WP<Resource>           resource;
+    bool                   hostEntered  = false;
+    bool                   automated    = false;
+    uint32_t               cursorSerial = 0;
+    WP<CWLSurfaceResource> cursorSurface;
+
+    SP<Resource>           lock() const {
+        return resource.lock();
+    }
+};
 
 struct Session {
-    uint64_t                                id = 0;
-    std::unique_ptr<Hyprauto::Capture::Job> capture;
-    wl_client*                              client = nullptr;
-    PHLWINDOWREF                            window;
-    WP<CWLSurfaceResource>                  surface;
-    std::vector<WP<CWLKeyboardResource>>    keyboards;
-    std::vector<WP<CWLPointerResource>>     pointers;
-    std::set<uint32_t>                      keys, buttons;
-    bool                                    blockInput = false;
-    Vector2D                                position   = {1, 1};
-    xkb_state*                              xkb        = nullptr;
-    CHyprSignalListener                     surfaceDestroy;
+    uint64_t                                       id = 0;
+    std::unique_ptr<Hyprauto::Capture::Job>        capture;
+    wl_client*                                     client = nullptr;
+    PHLWINDOWREF                                   window;
+    WP<CWLSurfaceResource>                         surface;
+    std::vector<InputBinding<CWLKeyboardResource>> keyboards;
+    std::vector<InputBinding<CWLPointerResource>>  pointers;
+    std::set<uint32_t>                             keys, buttons;
+    bool                                           blockInput = false;
+    Vector2D                                       position   = {1, 1};
+    xkb_state*                                     xkb        = nullptr;
+    std::string                                    keymap;
+    Hyprutils::OS::CFileDescriptor                 keymapFD;
+    CHyprSignalListener                            surfaceDestroy;
 };
 
 static std::map<uint64_t, std::unique_ptr<Session>> sessions;
@@ -79,18 +116,108 @@ static CFunctionHook* installHook(const std::string& name, void* destination) {
     return hook;
 }
 
+static void refreshResources(Session& session);
+
+static void enterPointer(CWLPointerResource* pointer, SP<CWLSurfaceResource> surface, const Vector2D& local, bool repeat = false) {
+    if (!repeat && pointer->m_currentSurface == surface)
+        return;
+    auto old = pointer->m_currentSurface.lock();
+    if (old && old != surface && old->getResource()->resource())
+        pointer->m_resource->sendLeave(g_pSeatManager->nextSerial(pointer->m_owner.lock()), old->getResource().get());
+    pointer->m_currentSurface.reset();
+    pointer->m_listeners.destroySurface.reset();
+    pointer->sendEnter(surface, local);
+}
+
+static void enterKeyboard(CWLKeyboardResource* keyboard, SP<CWLSurfaceResource> surface, wl_array* keys, bool repeat = false) {
+    if (!repeat && keyboard->m_currentSurface == surface)
+        return;
+    auto old = keyboard->m_currentSurface.lock();
+    if (old && old != surface && old->getResource()->resource())
+        keyboard->m_resource->sendLeave(g_pSeatManager->nextSerial(keyboard->m_owner.lock()), old->getResource().get());
+    keyboard->m_currentSurface.reset();
+    keyboard->m_listeners.destroySurface.reset();
+    keyboard->sendEnter(surface, keys);
+}
+
+template <typename Resource>
+static auto& bindings(Session& session) {
+    if constexpr (std::is_same_v<Resource, CWLKeyboardResource>)
+        return session.keyboards;
+    else
+        return session.pointers;
+}
+
+template <typename Resource>
+static InputBinding<Resource>* bindingFor(Session& session, Resource* resource) {
+    for (auto& binding : bindings<Resource>(session))
+        if (binding.lock().get() == resource)
+            return &binding;
+    return nullptr;
+}
+
+static Vector2D hostPointerPosition(SP<CWLSurfaceResource> surface) {
+    auto desktopSurface = Desktop::View::CWLSurface::fromResource(surface);
+    auto box            = desktopSurface ? desktopSurface->getSurfaceBoxGlobal() : std::nullopt;
+    return box ? g_pInputManager->getMouseCoordsInternal() - box->pos() : g_pSeatManager->m_lastLocalCoords;
+}
+
+static std::vector<uint32_t> enteredKeys(const Session& session, bool includeHost, bool includeAutomation = true) {
+    std::set<uint32_t> keys = includeAutomation ? session.keys : std::set<uint32_t>{};
+    if (includeHost) {
+        auto hostKeys = g_pInputManager->getKeysFromAllKBs();
+        keys.insert(hostKeys.begin(), hostKeys.end());
+    }
+    return {keys.begin(), keys.end()};
+}
+
 template <int ID, typename Resource, typename... Args>
 struct Gate {
     static inline CFunctionHook* hook       = nullptr;
-    static constexpr bool        focusEvent = ID == 0 || ID == 1 || ID == 4 || ID == 5;
     static constexpr bool        frameEvent = ID == 8;
 
     static void                  call(Resource* self, Args... args) {
         if (!automationDispatch && self->m_owner) {
             if (auto session = clientSession(self->m_owner->client())) {
-                const auto& hostFocus = std::is_same_v<Resource, CWLKeyboardResource> ? g_pSeatManager->m_state.keyboardFocus : g_pSeatManager->m_state.pointerFocus;
-                if (focusEvent || session->blockInput || (!frameEvent && (!hostFocus || hostFocus->client() != session->client)))
+                refreshResources(*session);
+                auto       binding   = bindingFor(*session, self);
+                const auto hostFocus = (std::is_same_v<Resource, CWLKeyboardResource> ? g_pSeatManager->m_state.keyboardFocus : g_pSeatManager->m_state.pointerFocus).lock();
+                if constexpr (ID == 1 || ID == 5) {
+                    if (binding)
+                        binding->hostEntered = false;
                     return;
+                } else if constexpr (ID == 0 || ID == 4) {
+                    if (!binding) {
+                        reinterpret_cast<void (*)(Resource*, Args...)>(hook->m_original)(self, args...);
+                        return;
+                    }
+                    const bool repeat           = !binding->hostEntered;
+                    binding->hostEntered        = true;
+                    const bool previousDispatch = automationDispatch;
+                    automationDispatch          = true;
+                    CScopeGuard restore([&] { automationDispatch = previousDispatch; });
+                    if constexpr (ID == 0) {
+                        auto     keys = enteredKeys(*session, !session->blockInput, std::get<0>(std::tuple(args...)) == session->surface);
+                        wl_array array{keys.size() * sizeof(uint32_t), keys.size() * sizeof(uint32_t), keys.data()};
+                        enterKeyboard(self, std::get<0>(std::tuple(args...)), &array, repeat);
+                    } else
+                        enterPointer(self, args..., repeat);
+                    return;
+                } else {
+                    if (session->blockInput || (!frameEvent && (!hostFocus || hostFocus->client() != session->client)))
+                        return;
+                    if constexpr (!frameEvent) {
+                        const bool previousDispatch = automationDispatch;
+                        automationDispatch          = true;
+                        CScopeGuard restore([&] { automationDispatch = previousDispatch; });
+                        if constexpr (std::is_same_v<Resource, CWLKeyboardResource>) {
+                            auto     keys = enteredKeys(*session, true, hostFocus == session->surface);
+                            wl_array array{keys.size() * sizeof(uint32_t), keys.size() * sizeof(uint32_t), keys.data()};
+                            enterKeyboard(self, hostFocus, &array);
+                        } else
+                            enterPointer(self, hostFocus, hostPointerPosition(hostFocus));
+                    }
+                }
             }
         }
         reinterpret_cast<void (*)(Resource*, Args...)>(hook->m_original)(self, args...);
@@ -122,6 +249,50 @@ static std::vector<SP<CWLSeatResource>> clientSeats(wl_client* client) {
         },
         &seats);
     return seats;
+}
+
+static void refreshResources(Session& session) {
+    std::erase_if(session.keyboards, [](const auto& binding) { return !binding.lock(); });
+    std::erase_if(session.pointers, [](const auto& binding) { return !binding.lock(); });
+    for (const auto& seat : clientSeats(session.client)) {
+        for (const auto& weak : seat->m_keyboards) {
+            if (auto keyboard = weak.lock(); keyboard && !bindingFor(session, keyboard.get()))
+                session.keyboards.push_back({keyboard, keyboard->m_currentSurface && keyboard->m_currentSurface == g_pSeatManager->m_state.keyboardFocus});
+        }
+        for (const auto& weak : seat->m_pointers) {
+            if (auto pointer = weak.lock(); pointer && !bindingFor(session, pointer.get()))
+                session.pointers.push_back({pointer, pointer->m_currentSurface && pointer->m_currentSurface == g_pSeatManager->m_state.pointerFocus});
+        }
+    }
+}
+
+static void ensureKeyboard(Session& session) {
+    auto     keys = enteredKeys(session, !session.blockInput && g_pSeatManager->m_state.keyboardFocus == session.surface);
+    wl_array array{keys.size() * sizeof(uint32_t), keys.size() * sizeof(uint32_t), keys.data()};
+    for (auto& binding : session.keyboards) {
+        if (auto keyboard = binding.lock()) {
+            if (keyboard->m_lastKeymap != session.keymap) {
+                keyboard->m_lastKeymap = session.keymap;
+                keyboard->m_resource->sendKeymap(WL_KEYBOARD_KEYMAP_FORMAT_XKB_V1, session.keymapFD.get(), session.keymap.size() + 1);
+            }
+            enterKeyboard(keyboard.get(), session.surface.lock(), &array, !binding.automated && !session.keys.empty());
+            binding.automated = true;
+        }
+    }
+    sendModifiers(session);
+}
+
+static void ensurePointer(Session& session) {
+    ensureKeyboard(session);
+    for (auto& binding : session.pointers) {
+        if (auto pointer = binding.lock()) {
+            enterPointer(pointer.get(), session.surface.lock(), session.position);
+            for (auto button : session.buttons)
+                if (std::ranges::find(pointer->m_pressedButtons, button) == pointer->m_pressedButtons.end())
+                    pointer->sendButton(now(), button, WL_POINTER_BUTTON_STATE_PRESSED);
+            binding.automated = true;
+        }
+    }
 }
 
 template <typename Callback>
@@ -161,12 +332,20 @@ static void clearTarget(Session& session, bool restoreHostFocus = true) {
     automationDispatch          = true;
     CScopeGuard restore([&] { automationDispatch = previousDispatch; });
     session.surfaceDestroy.reset();
+    refreshResources(session);
     for (const auto& weak : session.keyboards) {
         if (auto keyboard = weak.lock()) {
-            for (auto key : session.keys)
-                keyboard->sendKey(now(), key, WL_KEYBOARD_KEY_STATE_RELEASED);
-            keyboard->sendMods(0, 0, 0, 0);
-            keyboard->sendLeave();
+            if (weak.automated) {
+                if (session.surface) {
+                    auto     keys = enteredKeys(session, false);
+                    wl_array array{keys.size() * sizeof(uint32_t), keys.size() * sizeof(uint32_t), keys.data()};
+                    enterKeyboard(keyboard.get(), session.surface.lock(), &array);
+                }
+                for (auto key : session.keys)
+                    keyboard->sendKey(now(), key, WL_KEYBOARD_KEY_STATE_RELEASED);
+                keyboard->sendMods(0, 0, 0, 0);
+                keyboard->sendLeave();
+            }
             if (auto nativeKeyboard = g_pSeatManager->m_keyboard.lock()) {
                 keyboard->sendKeymap(nativeKeyboard);
                 keyboard->repeatInfo(nativeKeyboard->m_repeatRate, nativeKeyboard->m_repeatDelay);
@@ -174,9 +353,12 @@ static void clearTarget(Session& session, bool restoreHostFocus = true) {
         }
     }
     for (const auto& weak : session.pointers) {
-        if (auto pointer = weak.lock()) {
+        if (auto pointer = weak.lock(); pointer && weak.automated) {
+            if (session.surface)
+                enterPointer(pointer.get(), session.surface.lock(), session.position);
             for (auto button : session.buttons)
-                pointer->sendButton(now(), button, WL_POINTER_BUTTON_STATE_RELEASED);
+                if (std::ranges::find(pointer->m_pressedButtons, button) != pointer->m_pressedButtons.end())
+                    pointer->sendButton(now(), button, WL_POINTER_BUTTON_STATE_RELEASED);
             pointer->sendLeave();
             pointer->sendFrame();
         }
@@ -186,7 +368,7 @@ static void clearTarget(Session& session, bool restoreHostFocus = true) {
         auto     pressed = g_pInputManager->getKeysFromAllKBs();
         wl_array keys{pressed.size() * sizeof(uint32_t), pressed.size() * sizeof(uint32_t), pressed.data()};
         for (const auto& weak : session.keyboards) {
-            if (auto keyboard = weak.lock()) {
+            if (auto keyboard = weak.lock(); keyboard && weak.automated) {
                 keyboard->sendEnter(keyboardFocus, &keys);
                 const auto& mods = g_pSeatManager->m_keyboard->m_modifiersState;
                 keyboard->sendMods(mods.depressed, mods.latched, mods.locked, mods.group);
@@ -195,9 +377,9 @@ static void clearTarget(Session& session, bool restoreHostFocus = true) {
     }
     auto pointerFocus = g_pSeatManager->m_state.pointerFocus.lock();
     if (restoreHostFocus && pointerFocus && pointerFocus->client() == session.client && session.window) {
-        auto local = g_pInputManager->getMouseCoordsInternal() - session.window->position(Desktop::View::IGeometric::GEOMETRIC_CURRENT);
+        auto local = hostPointerPosition(pointerFocus);
         for (const auto& weak : session.pointers) {
-            if (auto pointer = weak.lock()) {
+            if (auto pointer = weak.lock(); pointer && weak.automated) {
                 pointer->sendEnter(pointerFocus, local);
                 pointer->sendFrame();
             }
@@ -209,6 +391,85 @@ static void clearTarget(Session& session, bool restoreHostFocus = true) {
     session            = {};
     session.id         = id;
     session.capture    = std::move(capture);
+}
+
+static uint32_t surfaceID(const WP<CWLSurfaceResource>& surface);
+
+static void     recordPointerEnter(CWlPointer* self, uint32_t serial, CWlSurface* surface, wl_fixed_t x, wl_fixed_t y) {
+    if (auto pointer = CWLPointerResource::fromResource(self->resource())) {
+        if (auto session = clientSession(wl_resource_get_client(self->resource()))) {
+            refreshResources(*session);
+            if (auto binding = bindingFor(*session, pointer.get())) {
+                binding->cursorSerial  = serial;
+                binding->cursorSurface = CWLSurfaceResource::fromResource(surface->resource());
+                Log::logger->log(Log::DEBUG, "[hyprauto] pointer enter: session {}, serial {}, surface {}, compositor pointer focus surface {}", session->id, serial,
+                                 surfaceID(binding->cursorSurface), surfaceID(g_pSeatManager->m_state.pointerFocus));
+            }
+        }
+    }
+    reinterpret_cast<void (*)(CWlPointer*, uint32_t, CWlSurface*, wl_fixed_t, wl_fixed_t)>(pointerEnterHook->m_original)(self, serial, surface, x, y);
+}
+
+static bool cursorAllowed(Session& session, uint32_t serial, CWLPointerResource* requestedPointer = nullptr) {
+    auto focus = g_pSeatManager->m_state.pointerFocus.lock();
+    if (!focus || focus->client() != session.client)
+        return false;
+    refreshResources(session);
+    for (const auto& binding : session.pointers) {
+        auto pointer = binding.lock();
+        if (!pointer || (requestedPointer && pointer.get() != requestedPointer) || pointer->m_currentSurface != focus)
+            continue;
+        if (!binding.cursorSerial || (binding.cursorSerial == serial && binding.cursorSurface == focus))
+            return true;
+    }
+    return false;
+}
+
+static void recordShapePointer(CCursorShapeProtocol* self, CWpCursorShapeManagerV1* manager, uint32_t id, wl_resource* pointer) {
+    reinterpret_cast<void (*)(CCursorShapeProtocol*, CWpCursorShapeManagerV1*, uint32_t, wl_resource*)>(shapePointerHook->m_original)(self, manager, id, pointer);
+    if (std::string_view(wl_resource_get_class(pointer)) != "wl_pointer")
+        return;
+    if (auto device = wl_client_get_object(manager->client(), id)) {
+        auto binding            = std::make_unique<ShapePointer>();
+        binding->resource       = device;
+        binding->pointer        = CWLPointerResource::fromResource(pointer);
+        binding->destroy.notify = [](wl_listener* listener, void*) {
+            auto binding = reinterpret_cast<ShapePointer*>(listener);
+            shapePointers.erase(binding->resource);
+        };
+        wl_resource_add_destroy_listener(device, &binding->destroy);
+        shapePointers[device] = std::move(binding);
+    }
+}
+
+static void traceSetShape(CCursorShapeProtocol* self, CWpCursorShapeDeviceV1* device, uint32_t serial, wpCursorShapeDeviceV1Shape shape) {
+    auto       session = clientSession(device->client());
+    auto       it      = shapePointers.find(device->resource());
+    auto       pointer = it == shapePointers.end() ? nullptr : it->second->pointer.lock();
+    const bool allowed = !session || ((it == shapePointers.end() || pointer) && cursorAllowed(*session, serial, pointer.get()));
+    Log::logger->log(Log::DEBUG, "[hyprauto] cursor-shape request: serial {}, shape {}, request session {}, session accepts {}", serial, static_cast<uint32_t>(shape),
+                     session ? std::to_string(session->id) : "none", allowed);
+    if (!allowed && static_cast<uint32_t>(shape) > 0 && static_cast<uint32_t>(shape) < CURSOR_SHAPE_NAMES.size())
+        return;
+    reinterpret_cast<void (*)(CCursorShapeProtocol*, CWpCursorShapeDeviceV1*, uint32_t, wpCursorShapeDeviceV1Shape)>(setShapeHook->m_original)(self, device, serial, shape);
+}
+
+static void traceSetCursor(CSeatManager* self, SP<CWLSeatResource> seat, uint32_t serial, SP<CWLSurfaceResource> cursorSurface, const Vector2D& hotspot) {
+    auto       focusResource   = self->m_state.pointerFocusResource.lock();
+    auto       focusSurface    = self->m_state.pointerFocus.lock();
+    auto       requestSession  = seat ? clientSession(seat->client()) : nullptr;
+    auto       focusSession    = focusSurface ? clientSession(focusSurface->client()) : nullptr;
+    const bool acceptedByFocus = seat && focusResource && seat->client() == focusResource->client();
+    const bool allowed         = !requestSession || cursorAllowed(*requestSession, serial);
+    Log::logger->log(Log::DEBUG,
+                     "[hyprauto] set_cursor request: serial {}, cursor surface {}, request session {}, compositor pointer focus surface {}, focus session {}, focus accepts {}, "
+                     "session accepts {}",
+                     serial, surfaceID(cursorSurface), requestSession ? std::to_string(requestSession->id) : "none", surfaceID(focusSurface),
+                     focusSession ? std::to_string(focusSession->id) : "none", acceptedByFocus, allowed);
+    if (!allowed)
+        return;
+    reinterpret_cast<void (*)(CSeatManager*, SP<CWLSeatResource>, uint32_t, SP<CWLSurfaceResource>, const Vector2D&)>(setCursorHook->m_original)(self, std::move(seat), serial,
+                                                                                                                                                 std::move(cursorSurface), hotspot);
 }
 
 static std::string setTarget(Session& current, const std::string& selector) {
@@ -224,20 +485,19 @@ static std::string setTarget(Session& current, const std::string& selector) {
     Session session;
     if (!g_pSeatManager->m_keyboard || !g_pSeatManager->m_mouse)
         return "error: keyboard and pointer capabilities required";
-    for (const auto& seat : clientSeats(client)) {
-        for (const auto& keyboard : seat->m_keyboards)
-            if (keyboard)
-                session.keyboards.push_back(keyboard);
-        for (const auto& pointer : seat->m_pointers)
-            if (pointer)
-                session.pointers.push_back(pointer);
-    }
+    session.client = client;
+    refreshResources(session);
     if (session.keyboards.empty() || session.pointers.empty())
         return "error: target must bind keyboard and pointer before beginning";
     session.xkb = xkb_state_new(g_pSeatManager->m_keyboard->m_xkbKeymap);
     if (!session.xkb)
         return "error: cannot create independent XKB state";
-    session.client  = client;
+    session.keymap   = g_pSeatManager->m_keyboard->m_xkbKeymapV1String;
+    session.keymapFD = g_pSeatManager->m_keyboard->m_xkbKeymapV1FD.duplicate();
+    if (!session.keymapFD.isValid()) {
+        xkb_state_unref(session.xkb);
+        return "error: cannot retain session keymap";
+    }
     session.window  = window;
     session.surface = surface;
     clearTarget(current);
@@ -248,20 +508,7 @@ static std::string setTarget(Session& current, const std::string& selector) {
         if (auto it = sessions.find(id); it != sessions.end())
             clearTarget(*it->second, false);
     });
-    wl_array keys{};
-    for (const auto& weak : current.keyboards) {
-        if (auto keyboard = weak.lock()) {
-            keyboard->sendKeymap(g_pSeatManager->m_keyboard.lock());
-            keyboard->sendEnter(surface, &keys);
-        }
-    }
-    sendModifiers(current);
-    for (const auto& weak : current.pointers) {
-        if (auto pointer = weak.lock()) {
-            pointer->sendEnter(surface, current.position);
-            pointer->sendFrame();
-        }
-    }
+    Log::logger->log(Log::DEBUG, "[hyprauto] session {} bound target surface {}; synthetic focus deferred until input", current.id, surfaceID(current.surface));
     return "ok";
 }
 
@@ -363,6 +610,13 @@ static std::string dispatchSession(uint64_t id, const std::string& request) {
         bool  down    = state == "down";
         if (pressed.contains(code) == down)
             return "error: unpaired input state";
+        refreshResources(session);
+        if (operation == "key" ? session.keyboards.empty() : session.pointers.empty())
+            return "error: target has no live input resource";
+        if (operation == "key")
+            ensureKeyboard(session);
+        else
+            ensurePointer(session);
         if (down)
             pressed.insert(code);
         else
@@ -391,7 +645,11 @@ static std::string dispatchSession(uint64_t id, const std::string& request) {
         if (!(input >> x >> y) || input >> extra || !std::isfinite(x) || !std::isfinite(y) || x < 0 || y < 0 || x >= session.surface->m_current.size.x ||
             y >= session.surface->m_current.size.y)
             return "error: coordinates must be inside the target surface";
+        refreshResources(session);
+        if (session.pointers.empty())
+            return "error: target has no live pointer";
         session.position = {x, y};
+        ensurePointer(session);
         for (const auto& weak : session.pointers) {
             if (auto pointer = weak.lock()) {
                 pointer->sendMotion(now(), session.position);
@@ -452,12 +710,38 @@ APICALL EXPORT PLUGIN_DESCRIPTION_INFO PLUGIN_INIT(HANDLE pluginHandle) {
     Gate<12, CWLPointerResource, wl_pointer_axis, int32_t>::install("CWLPointerResource::sendAxisDiscrete");
     Gate<13, CWLPointerResource, wl_pointer_axis, int32_t>::install("CWLPointerResource::sendAxisValue120");
     Gate<14, CWLPointerResource, wl_pointer_axis, wl_pointer_axis_relative_direction>::install("CWLPointerResource::sendAxisRelativeDirection");
+    pointerEnterHook = installHook("CWlPointer::sendEnter", reinterpret_cast<void*>(&recordPointerEnter));
+    shapePointerHook = installHook("CCursorShapeProtocol::createCursorShapeDevice", reinterpret_cast<void*>(&recordShapePointer));
+    setShapeHook     = installHook("CCursorShapeProtocol::onSetShape", reinterpret_cast<void*>(&traceSetShape));
+    setCursorHook    = installHook("CSeatManager::onSetCursor", reinterpret_cast<void*>(&traceSetCursor));
     keymapHook = installHook("CWLSeatProtocol::updateKeymap", reinterpret_cast<void*>(&updateHostKeymaps));
     repeatHook = installHook("CWLSeatProtocol::updateRepeatInfo", reinterpret_cast<void*>(&updateHostRepeatInfo));
     command    = Hyprauto::Compat::registerCommand(handle, "hyprauto", dispatchManagement);
     if (!command)
         throw std::runtime_error("Cannot register hyprauto command");
-    hostCursorListener = g_pSeatManager->m_events.setCursor.listen([](const auto&) { ++hostCursorUpdates; });
+    hostCursorListener   = g_pSeatManager->m_events.setCursor.listen([](const auto& event) {
+        ++hostCursorUpdates;
+        Log::logger->log(Log::DEBUG, "[hyprauto] compositor accepted set_cursor: cursor surface {}, pointer focus surface {}, cursor hotspot ({:.1f}, {:.1f})",
+                         surfaceID(event.surf), surfaceID(g_pSeatManager->m_state.pointerFocus), event.hotspot.x, event.hotspot.y);
+    });
+    pointerFocusListener = g_pSeatManager->m_events.pointerFocusChange.listen([] {
+        auto focus   = g_pSeatManager->m_state.pointerFocus.lock();
+        auto session = focus ? clientSession(focus->client()) : nullptr;
+        Log::logger->log(Log::DEBUG, "[hyprauto] compositor pointer focus changed: surface {}, hyprauto session {}", surfaceID(g_pSeatManager->m_state.pointerFocus),
+                         session ? std::to_string(session->id) : "none");
+    });
+    cursorShapeListener  = PROTO::cursorShape->m_events.setShape.listen([](const CCursorShapeProtocol::SSetShapeEvent& event) {
+        auto       focusResource   = g_pSeatManager->m_state.pointerFocusResource.lock();
+        auto       focus           = g_pSeatManager->m_state.pointerFocus.lock();
+        auto       requestSession  = clientSession(event.pMgr->client());
+        auto       focusSession    = focus ? clientSession(focus->client()) : nullptr;
+        const bool acceptedByFocus = focusResource && event.pMgr->client() == focusResource->client();
+        if (acceptedByFocus)
+            ++hostCursorUpdates;
+        Log::logger->log(Log::DEBUG, "[hyprauto] cursor-shape request: shape {}, request session {}, compositor pointer focus surface {}, focus session {}, focus accepts {}",
+                         event.shapeName, requestSession ? std::to_string(requestSession->id) : "none", surfaceID(focus), focusSession ? std::to_string(focusSession->id) : "none",
+                         acceptedByFocus);
+    });
     windowClose        = Event::bus()->m_events.window.close.listen([](PHLWINDOW window) {
         for (const auto& [id, session] : sessions)
             if (window == session->window.lock())
@@ -478,6 +762,7 @@ APICALL EXPORT PLUGIN_DESCRIPTION_INFO PLUGIN_INIT(HANDLE pluginHandle) {
             }
         },
         dispatchSession);
+    Log::logger->log(Log::DEBUG, "[hyprauto] plugin initialized; pointer focus and set_cursor tracing enabled");
     return {"hyprauto", "Independent background Wayland input sessions", "hyprauto contributors", HYPRAUTO_VERSION};
 }
 
@@ -485,9 +770,12 @@ APICALL EXPORT void PLUGIN_EXIT() {
     server.reset();
     windowClose.reset();
     hostCursorListener.reset();
+    pointerFocusListener.reset();
+    cursorShapeListener.reset();
     HyprlandAPI::unregisterHyprCtlCommand(handle, command);
     command.reset();
     for (auto hook : hooks)
         HyprlandAPI::removeFunctionHook(handle, hook);
     hooks.clear();
+    shapePointers.clear();
 }

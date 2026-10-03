@@ -298,8 +298,7 @@ def run(binary, build_dir, plugin):
             unchanged(lambda: auto("begin class:target"))
             assert not status()["block_input"]
             events = target.events[start:]
-            assert events.count("keyboard-enter") == 1, events
-            assert "pointer-enter 1.000 1.000" in events, events
+            assert not [e for e in events if e != "sync"], events
             assert "active 1" not in events, events
             screenshot = runtime / "target capture.png"
             capture_host = status()["host"]
@@ -321,8 +320,21 @@ def run(binary, build_dir, plugin):
             assert png_pixel(screenshot, 304, 224) == (32, 64, 128, 255)
             assert status()["host"] == capture_host, (capture_host, status()["host"])
             check("socket PNG capture crops target pixels and ignores Hyprland window opacity and inactive dim")
-            check("background session enters once without changing host focus or activation")
             auto("end")
+            assert not [e for e in target.sync()[start:] if e != "sync"], target.events[start:]
+            check("binding, capture and closing an unused session do not change client focus")
+            auto("begin class:target")
+            mouse_first_start = len(target.sync())
+            assert command("/hyprauto move -1 10").startswith("error:")
+            assert command("/hyprauto button 1 down").startswith("error:")
+            assert not [e for e in target.sync()[mouse_first_start:] if e != "sync"], target.events[mouse_first_start:]
+            unchanged(lambda: auto("move 40 50"))
+            mouse_first = target.sync()[mouse_first_start:]
+            assert mouse_first.count("keyboard-enter") == 1, mouse_first
+            assert mouse_first.count("pointer-enter 40.000 50.000") == 1, mouse_first
+            assert mouse_first.index("keyboard-enter") < mouse_first.index("pointer-enter 40.000 50.000"), mouse_first
+            auto("end")
+            check("first mouse injection establishes keyboard and pointer focus; invalid input does not")
             python_capture = subprocess.run(
                 [sys.executable, "-c", """
 from hyprauto_ctrl import HyprAutoController
@@ -365,9 +377,13 @@ finally:
             assert command(f"/hyprauto screenshot-status {capture_id}").startswith("error:")
             check("raw socket chunks and NumPy captures preserve alpha and orientation; stale jobs and invalid reads are rejected")
 
+            deferred_start = len(target.sync())
             auto("key 42 down")
             auto("key 30 down")
+            assert sum(e.startswith("keyboard-enter") for e in target.sync()[deferred_start:]) == 1
+            assert not any(e.startswith("pointer-enter") for e in target.events[deferred_start:])
             auto("button 272 down")
+            assert sum(e.startswith("pointer-enter") for e in target.sync()[deferred_start:]) == 1
             unchanged(lambda: auto("move 40 50"))
             target.sync()
             assert "key 30 1 65" in target.events, target.events
@@ -407,6 +423,12 @@ finally:
             assert "key 21 1 121" in target.events[layout_start:], target.events[layout_start:]
             assert "keymap" not in target.events[layout_start:], target.events[layout_start:]
             assert "key 21 1 122" in host_a.sync(), host_a.events
+            target.request("bind", "bound")
+            rebound_layout_start = len(target.sync())
+            unchanged(lambda: (auto("key 21 down"), auto("key 21 up")))
+            rebound_layout = target.events[rebound_layout_start:]
+            assert "keymap" in rebound_layout and rebound_layout.count("key 21 1 121") == 2, rebound_layout
+            target.request("unbind", "unbound")
             auto("end")
             target.sync()
             assert "keymap" in target.events[layout_start:]
@@ -458,13 +480,25 @@ finally:
             cursor_before = status()["host"]["cursor_updates"]
             target.request("cursor", "cursor-set")
             assert status()["host"]["cursor_updates"] == cursor_before + 1
+            target.request("shape", "shape-set")
+            assert status()["host"]["cursor_updates"] == cursor_before + 2
+            unchanged(lambda: target.request("stale-cursor", "stale-cursor-set"))
             host_move("target", 150, 160)
             departure_start = len(target.sync())
             focus("host-a")
             assert "frame" in target.events[departure_start:], target.events[departure_start:]
             unchanged(lambda: target.request("cursor", "cursor-set"))
+            unchanged(lambda: target.request("shape", "shape-set"))
+            reentry_start = len(target.sync())
             focus("target")
-            check("native cursor routing and final pointer frames preserve foreground input")
+            reentry = target.events[reentry_start:]
+            assert any(e.startswith("keyboard-enter") for e in reentry), reentry
+            assert any(e.startswith("pointer-enter") for e in reentry), reentry
+            assert "button 272 0" not in reentry, reentry
+            cursor_before = status()["host"]["cursor_updates"]
+            target.request("shape", "shape-set")
+            assert status()["host"]["cursor_updates"] == cursor_before + 1
+            check("real re-entry restores both cursor protocols without releasing held buttons")
 
             unchanged(lambda: auto("block-input on"))
             assert status()["block_input"]
@@ -496,8 +530,11 @@ finally:
             focus("target")
             assert "keyboard-leave" not in target.events[visit_start:]
             assert "pointer-leave" not in target.events[visit_start:]
-            assert "keyboard-enter" not in target.events[visit_start:]
-            check("block-input suppresses target host events, not automation or other clients")
+            assert any(e.startswith("keyboard-enter") for e in target.events[blocked_start:]), target.events[blocked_start:]
+            assert any(e.startswith("pointer-enter") for e in target.events[blocked_start:]), target.events[blocked_start:]
+            assert "button 272 0" not in target.events[visit_start:], target.events[visit_start:]
+            assert not any(e.startswith(("key 30 0 ", "key 42 0 ")) for e in target.events[blocked_start:]), target.events[blocked_start:]
+            check("blocking preserves re-entry notifications and held automation inputs")
 
             unchanged(lambda: auto("block-input off"))
             assert not status()["block_input"]
@@ -616,6 +653,105 @@ finally:
             assert "keyboard-leave" not in foreground
             auto("end")
             check("unload/reload restores host routing and permits coexisting foreground sessions")
+
+            focus("target")
+            host_key(42, True)
+            host_click(273, True)
+            unused_start = len(target.sync())
+            unchanged(lambda: auto("begin class:target"))
+            unchanged(lambda: auto("end"))
+            assert not [e for e in target.sync()[unused_start:] if e != "sync"], target.events[unused_start:]
+            host_key(42, False)
+            host_click(273, False)
+            check("connecting and closing an unused foreground session preserve held physical input")
+
+            focus("host-a")
+            auto("begin class:target")
+            auto("key 42 down")
+            auto("button 272 down")
+            binding_start = len(target.sync())
+            target.request("bind", "bound")
+            assert not any(e.startswith(("keyboard-enter", "pointer-enter")) for e in target.events[binding_start:]), target.events[binding_start:]
+            auto("move 60 70")
+            bound = target.sync()[binding_start:]
+            assert "keyboard-enter 42" in bound, bound
+            assert "pointer-enter 60.000 70.000" in bound, bound
+            assert "button 272 1" in bound, bound
+            assert bound.count("motion 60.000 70.000") == 2, bound
+            auto("block-input on")
+            reentry_start = len(target.sync())
+            focus("target")
+            reentry = target.events[reentry_start:]
+            assert sum(e.startswith("keyboard-enter") for e in reentry) == 2, reentry
+            assert sum(e.startswith("pointer-enter") for e in reentry) == 2, reentry
+            cursor_before = status()["host"]["cursor_updates"]
+            target.request("cursor", "cursor-set")
+            assert status()["host"]["cursor_updates"] == cursor_before + 2
+            target.request("shape", "shape-set")
+            assert status()["host"]["cursor_updates"] == cursor_before + 4
+            unchanged(lambda: target.request("cross-shape", "cross-shape-set"))
+            blocked_start = len(target.sync())
+            host_key(48, True)
+            host_key(48, False)
+            host_click(273, True)
+            host_click(273, False)
+            assert not [e for e in target.sync()[blocked_start:] if e != "sync"], target.events[blocked_start:]
+            target.request("unbind", "unbound")
+            target.request("bind", "bound")
+            rebound_start = len(target.sync())
+            auto("key 30 down")
+            assert "keyboard-enter 42" in target.sync()[rebound_start:], target.events[rebound_start:]
+            auto("key 30 up")
+            auto("button 272 up")
+            auto("key 42 up")
+            auto("end")
+            target.request("unbind", "unbound")
+            check("dynamic input bindings inherit held state, cursor authority and blocking; destroyed bindings are removed")
+
+            focus("host-a")
+            auto("begin class:target")
+            auto("key 46 down")
+            auto("button 272 down")
+            other_entry_start = len(target.sync())
+            target.request("window", "window-created")
+            wait_for(lambda: len(json.loads(command("j/clients"))) == 4 and client_info("target-other")["visible"], "visible second target window")
+            focus("target-other")
+            other_entry = target.events[other_entry_start:]
+            assert "keyboard-enter-other" in other_entry, other_entry
+            assert "keyboard-enter-other 46" not in other_entry, other_entry
+            other_start = len(target.sync())
+            host_key(48, True)
+            host_key(48, False)
+            host_click(273, True)
+            host_click(273, False)
+            other = target.sync()[other_start:]
+            assert any(e.startswith("other-key 48 1 ") for e in other), other
+            assert "other-button 273 1" in other, other
+            unchanged(lambda: auto("move 40 50"))
+            unchanged(lambda: (auto("key 30 down"), auto("key 30 up")))
+            injected = target.sync()[other_start:]
+            assert "key 30 1 97" in injected and "motion 40.000 50.000" in injected, injected
+            unchanged(lambda: target.request("cursor", "cursor-set"))
+            unchanged(lambda: target.request("shape", "shape-set"))
+            host_key(48, True)
+            host_key(48, False)
+            host_move("target-other", 150, 160)
+            resumed = target.sync()[other_start:]
+            assert resumed.count("other-key 48 1 98") == 2, resumed
+            assert "other-motion 150.000 160.000" in resumed, resumed
+            cursor_before = status()["host"]["cursor_updates"]
+            target.request("shape", "shape-set")
+            assert status()["host"]["cursor_updates"] == cursor_before + 1
+            assert status()["keys"] == [46] and status()["buttons"] == [272]
+            assert "button 272 0" not in target.events[other_entry_start:], target.events[other_entry_start:]
+            cleanup_start = len(target.sync())
+            auto("end")
+            cleanup = target.sync()[cleanup_start:]
+            assert "key 46 0 99" in cleanup and "button 272 0" in cleanup, cleanup
+            assert not any(e.startswith(("other-key 46 ", "other-button 272 ")) for e in cleanup), cleanup
+            target.request("close-window", "window-closed")
+            focus("host-b")
+            check("manual input follows another window on the same client while automation remains on its selected target")
 
             service = json.loads(ipc_command("/hyprauto status"))
             assert service["protocol"] == 1 and service["socket"] == str(ipc.parent / ".hyprauto.sock"), service

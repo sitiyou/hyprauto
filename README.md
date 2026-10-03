@@ -54,7 +54,7 @@ Closing or unmapping a target releases its input and invalidates its screenshot,
 
 ### User and automation input
 
-By default, user input and automation input can coexist. Host focus changes do not interrupt automation. Before injecting a key or button, automation reapplies its own modifiers or pointer position.
+By default, user input and automation input can coexist. Connecting or taking screenshots does not change the target's input focus. Host focus changes do not interrupt automation, and user input follows the focused window, including another window of the same application. Before injecting a key or button, automation reapplies its own modifiers or pointer position.
 
 To block user input to a session's target:
 
@@ -63,7 +63,7 @@ controller.post_block_input(True).wait()
 controller.post_block_input(False).wait()
 ```
 
-Blocking filters user keyboard and pointer events sent to that Wayland client. It does not affect automation, other clients, host focus, physical cursor movement or Hyprland key bindings. The policy resets when the target binding ends.
+Blocking filters user keyboard and pointer events sent to that Wayland client. It does not affect automation, other clients, host focus, physical cursor movement, foreground cursor appearance or Hyprland key bindings. The policy resets when the target binding ends.
 
 User and automation events share the target client's protocol resources; application-level state isolation is not guaranteed. Overlapping presses, releases and interleaved events may affect the application. Toggling the block policy does not replay physical input state; release held user keys and buttons before changing it.
 
@@ -97,8 +97,8 @@ hyprpm remove https://github.com/sitiyou/hyprauto.git
 ## Scope
 
 - Multiple sessions for different native Wayland clients; one target per session and one session per client. At most 64 connections are accepted.
-- The target main surface retains protocol focus on all bound keyboard and pointer resources. This is not a second seat and does not isolate multiple windows belonging to the same Wayland client. User input for another window on that connection may reach the automation target.
+- Automation remains on the selected target while user input follows host focus. Keyboard and pointer rebinding is supported during a session; application-level input state isolation is not guaranteed.
 - The socket is local and restricted to the user running Hyprland. Cross-user and network access are not supported.
-- XWayland, IME, popup/subsurface hit-testing, pointer-lock/relative-pointer, touch/tablet, scroll injection, drag-and-drop and resource rebinding during a target binding are not supported.
+- XWayland, IME, popup/subsurface hit-testing, pointer-lock/relative-pointer, touch/tablet, scroll injection and drag-and-drop are not supported.
 - Protocol behavior is tested with the included client. Compatibility with GTK, Qt, browsers and games requires separate testing.
 
