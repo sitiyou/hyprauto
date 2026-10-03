@@ -112,4 +112,22 @@ make uninstall
 - XWayland, IME, popup/subsurface hit-testing, pointer-lock/relative-pointer, touch/tablet, scroll injection, drag-and-drop, and resource rebinding during a session are not supported.
 - Protocol behavior is tested with the included client. Compatibility with GTK, Qt, browsers, and games requires separate testing.
 
+## Python controller
+
+`hyprauto_ctrl` provides an asynchronous Python controller using the same core method names as MaaFramework. Pass `target` at construction or change the selected window with `set_target()`. Target changes replace the current session. `post_connection(instance=...)` can select a Hyprland instance; when omitted, it uses `HYPRLAND_INSTANCE_SIGNATURE` from the environment. The runtime socket is resolved under `XDG_RUNTIME_DIR`.
+
+```python
+from hyprauto_ctrl import HyprAutoController
+
+controller = HyprAutoController(target="class:target")
+controller.post_connection().wait()
+controller.post_click(40, 50).wait()
+controller.post_click_key(30).wait()
+image = controller.post_screencap().wait().get()
+controller.set_target("address:0x...").wait()
+controller.close()
+```
+
+Screenshots are returned as NumPy BGR images and the latest capture is available from `controller.cached_image`. Jobs expose `succeeded` and `error`. The plugin currently permits one active session per Hyprland instance, so selecting another target switches the active session; it does not create simultaneous sessions. `close()` ends the active session without unloading the plugin.
+
 The project includes `hyprpm.toml` for building and managing the plugin with hyprpm. See the [development guide](docs/development.md) for build, isolated headless testing, and implementation details.
