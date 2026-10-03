@@ -6,6 +6,7 @@ import socket
 import struct
 import tempfile
 import threading
+import time
 import zlib
 from pathlib import Path
 from typing import Any
@@ -69,12 +70,8 @@ class JobWithResult(Job):
 
 
 class HyprAutoController:
-    def __init__(
-        self,
-        target: str | None = None,
-        instance: str | None = None,
-    ) -> None:
-        self.target = target
+    def __init__(self, instance: str | None = None) -> None:
+        self.target: str | None = None
         self.instance = instance
         self._lock = threading.Lock()
         self._connected = False
@@ -114,12 +111,12 @@ class HyprAutoController:
         threading.Thread(target=run, daemon=True).start()
         return job
 
-    def post_connection(self, instance: str | None = None) -> Job:
+    def post_connection(self, target: str | None = None) -> Job:
         def connect() -> str:
             if self._connected:
                 self._command("end")
                 self._connected = False
-            signature = instance or self.instance or os.environ.get("HYPRLAND_INSTANCE_SIGNATURE")
+            signature = self.instance or os.environ.get("HYPRLAND_INSTANCE_SIGNATURE")
             runtime_dir = os.environ.get("XDG_RUNTIME_DIR")
             if not signature or not runtime_dir:
                 raise RuntimeError("Hyprland instance and XDG_RUNTIME_DIR are required")
@@ -132,10 +129,12 @@ class HyprAutoController:
                 raise RuntimeError(f"cannot connect to Hyprland IPC socket {path}: {exc}") from exc
             self.instance = signature
             self._socket_path = path
-            if self.target:
-                output = self._command("begin", self.target)
+            if target:
+                output = self._command("begin", target)
+                self.target = target
                 self._connected = True
                 return output
+            self.target = None
             return "ok"
 
         return self._submit(connect)
@@ -175,9 +174,13 @@ class HyprAutoController:
     def post_key_up(self, key: int) -> Job:
         return self._submit(lambda: self._command("key", str(key), "up"))
 
-    def post_click_key(self, key: int) -> Job:
+    def post_click_key(self, key: int, hold_ms: int = 50) -> Job:
+        if hold_ms < 0:
+            return Job(error="hold duration must not be negative")
+
         def click() -> str:
             self._command("key", str(key), "down")
+            time.sleep(hold_ms / 1000)
             return self._command("key", str(key), "up")
 
         return self._submit(click)

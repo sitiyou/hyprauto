@@ -17,13 +17,6 @@ hyprpm enable hyprauto
 
 The plugin uses private Hyprland hooks, so hyprpm must build it against headers matching your Hyprland revision. After upgrading Hyprland, run `hyprpm update` to rebuild plugins.
 
-To uninstall:
-
-```sh
-hyprpm disable hyprauto
-hyprpm remove https://github.com/sitiyou/hyprauto.git
-```
-
 When using an isolated instance, pass `hyprctl --instance "$INSTANCE"` and use that instance's `XDG_RUNTIME_DIR`.
 
 ## Usage
@@ -76,11 +69,9 @@ User and automation events share the target client's protocol resources; applica
 
 ## Uninstallation
 
-Remove any startup-load configuration, then run:
-
 ```sh
-hyprctl plugin unload "$HOME/.local/lib/hyprland/hyprauto.so"
-make uninstall
+hyprpm disable hyprauto
+hyprpm remove https://github.com/sitiyou/hyprauto.git
 ```
 
 ## Scope
@@ -92,13 +83,13 @@ make uninstall
 
 ## Python controller
 
-`hyprauto_ctrl` provides an asynchronous Python controller using the same core method names as MaaFramework. Pass `target` at construction or change the selected window with `set_target()`. Target changes replace the current session. `post_connection(instance=...)` can select a Hyprland instance; when omitted, it uses `HYPRLAND_INSTANCE_SIGNATURE` from the environment. The runtime socket is resolved under `XDG_RUNTIME_DIR`.
+`hyprauto_ctrl` provides an asynchronous Python controller using the same core method names as MaaFramework. Pass `instance` at construction; when omitted, it uses `HYPRLAND_INSTANCE_SIGNATURE` from the environment. Pass the target selector to `post_connection()` or change the selected window later with `set_target()`. Target changes replace the current session. `post_click_key(key, hold_ms=50)` holds the key for 50 ms by default. The runtime socket is resolved under `XDG_RUNTIME_DIR`.
 
 ```python
 from hyprauto_ctrl import HyprAutoController
 
-controller = HyprAutoController(target="class:target")
-controller.post_connection().wait()
+controller = HyprAutoController(instance="instance-signature")
+controller.post_connection("class:target").wait()
 controller.post_click(40, 50).wait()
 controller.post_click_key(30).wait()
 image = controller.post_screencap().wait().get()
