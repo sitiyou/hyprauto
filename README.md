@@ -71,7 +71,7 @@ User and automation events share the target client's protocol resources; applica
 
 `post_screencap()` returns a NumPy BGR image directly, without PNG encoding, decoding or temporary files. The latest image is available from `controller.cached_image`.
 
-Each session can retain one capture at a time; different sessions can capture independently. Screenshots require a mapped target and Hyprland's OpenGL renderer. Targets with `noscreenshare` enabled are rejected. The image is confined to the main-surface bounds, not the monitor or host cursor; subsurfaces and popups within those bounds may be included. Hyprland window opacity and decorations are excluded. Client-surface alpha is preserved by the socket protocol and removed by the Python controller.
+Each session can retain one capture at a time; different sessions can capture independently. Screenshots require a mapped target and Hyprland's OpenGL renderer. Targets with `noscreenshare` enabled are rejected. The image is confined to the main-surface bounds, not the monitor or host cursor; subsurfaces and popups within those bounds may be included. Hyprland window opacity, inactive-window dimming and decorations are excluded. Client-surface alpha is preserved by the socket protocol and removed by the Python controller.
 
 ## Management with hyprctl
 

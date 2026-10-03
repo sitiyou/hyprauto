@@ -320,7 +320,7 @@ def run(binary, build_dir, plugin):
             assert png_pixel(screenshot, 16, 16) == (128, 64, 32, 128)
             assert png_pixel(screenshot, 304, 224) == (32, 64, 128, 255)
             assert status()["host"] == capture_host, (capture_host, status()["host"])
-            check("socket PNG capture crops target pixels and ignores Hyprland window opacity")
+            check("socket PNG capture crops target pixels and ignores Hyprland window opacity and inactive dim")
             check("background session enters once without changing host focus or activation")
             auto("end")
             python_capture = subprocess.run(

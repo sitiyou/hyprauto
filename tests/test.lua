@@ -2,7 +2,7 @@ hl.monitor({ output = "HEADLESS-1", mode = "1280x720@60", position = "0x0", scal
 hl.config({
     animations = { enabled = false },
     debug = { enable_stdout_logs = true },
-    decoration = { blur = { enabled = false }, shadow = { enabled = false } },
+    decoration = { blur = { enabled = false }, dim_inactive = true, dim_strength = 0.5, shadow = { enabled = false } },
     input = { follow_mouse = 1 },
     misc = { disable_hyprland_logo = true, disable_splash_rendering = true },
 })

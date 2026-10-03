@@ -1,5 +1,8 @@
 #include "Capture.hpp"
 #include <src/render/Renderer.hpp>
+#include <src/render/pass/SurfacePassElement.hpp>
+#include <src/protocols/core/Compositor.hpp>
+#include <src/desktop/view/Popup.hpp>
 #include <src/helpers/cm/ColorManagement.hpp>
 #include <hyprutils/utils/ScopeGuard.hpp>
 #include <nlohmann/json.hpp>
@@ -13,10 +16,6 @@ using nlohmann::json;
 using Render::GL::g_pHyprOpenGL;
 
 namespace Hyprauto::Capture {
-    struct RendererAccess : Render::IHyprRenderer {
-        using IHyprRenderer::renderWindow;
-    };
-
     struct Job::State {
         uint64_t                              id     = 0;
         bool                                  active = false;
@@ -96,7 +95,42 @@ namespace Hyprauto::Capture {
             g_pHyprRenderer->setViewport(0, 0, width, height);
             g_pHyprRenderer->draw(CClearPassElement::SClearData{{0, 0, 0, 0}}, damage);
             g_pHyprRenderer->startRenderPass();
-            (g_pHyprRenderer.get()->*&RendererAccess::renderWindow)(window, monitor, Time::steadyNow(), false, Render::RENDER_PASS_ALL, true, true);
+            const auto now            = Time::steadyNow();
+            const auto windowSize     = window->getWindowMainSurfaceBox().size();
+            auto       addSurfaceTree = [&](SP<CWLSurfaceResource> root, const Vector2D& pos, bool popup, bool squishOversized) {
+                int surfaceCounter = 0;
+                root->breadthfirst(
+                    [&](SP<CWLSurfaceResource> surface, const Vector2D& offset, void*) {
+                        if (!surface->m_current.texture || surface->m_current.size.x < 1 || surface->m_current.size.y < 1)
+                            return;
+                        CSurfacePassElement::SRenderData renderdata{monitor, now};
+                        renderdata.pos             = pos;
+                        renderdata.localPos        = offset;
+                        renderdata.surface         = surface;
+                        renderdata.texture         = surface->m_current.texture;
+                        renderdata.mainSurface     = !popup && surface == root;
+                        renderdata.w               = windowSize.x;
+                        renderdata.h               = windowSize.y;
+                        renderdata.dontRound       = true;
+                        renderdata.alpha           = 1.F;
+                        renderdata.fadeAlpha       = 1.F;
+                        renderdata.blur            = false;
+                        renderdata.squishOversized = squishOversized;
+                        renderdata.popup           = popup;
+                        renderdata.surfaceCounter  = surfaceCounter++;
+                        g_pHyprRenderer->addPassElement(makeUnique<CSurfacePassElement>(renderdata));
+                    },
+                    nullptr);
+            };
+            addSurfaceTree(window->wlSurface()->resource(), monitor->m_position, false, true);
+            const auto geometry = window->backend().geometry().box;
+            window->popupHead()->breadthfirst(
+                [&](SP<Desktop::View::CPopup> popup, void*) {
+                    if (!popup->mapped() || !popup->acceptsInput() || !popup->alphaNonZero())
+                        return;
+                    addSurfaceTree(popup->wlSurface()->resource(), monitor->m_position - geometry.pos() + popup->coordsRelativeToParent(), true, false);
+                },
+                nullptr);
             g_pHyprRenderer->m_renderData.blockScreenShader = true;
             g_pHyprRenderer->endRender();
             g_pHyprRenderer->m_renderData.pMonitor.reset();
