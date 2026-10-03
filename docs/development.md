@@ -2,7 +2,7 @@
 
 ## Build and install
 
-The default build uses `pkg-config hyprland`, including hyprpm's `PKG_CONFIG_PATH` when provided. Plugin builds do not require Python, bubblewrap, Wayland scanner or the test helpers.
+The default build uses `pkg-config hyprland`, including hyprpm's `PKG_CONFIG_PATH` when provided. Capture also links GLESv2 and the platform thread library. Plugin builds do not require Python, bubblewrap, Wayland scanner or the test helpers.
 
 ```sh
 cmake -S . -B build -DCMAKE_BUILD_TYPE=Release -DCMAKE_INSTALL_PREFIX="$HOME/.local"
@@ -32,7 +32,7 @@ That checkout must provide the matching generated version and protocol headers. 
 
 ## Headless integration tests
 
-Tests are opt-in and require Python 3, `nm`, `bwrap`, Wayland protocols/scanner, a DRM render node, and a matching Hyprland checkout containing the hyprtester plugin source.
+Tests are opt-in and require Python 3 with NumPy, `nm`, `bwrap`, Wayland protocols/scanner, a DRM render node, and a matching Hyprland checkout containing the hyprtester plugin source. Use `-DPython3_EXECUTABLE=/path/to/venv/bin/python` to select an environment with NumPy.
 
 ```sh
 cmake -S . -B build-tests -DCMAKE_BUILD_TYPE=Release \
@@ -78,7 +78,7 @@ Bubblewrap gives the compositor a private PID namespace, `/dev` and `/run`, with
 12. Invalid input, malformed block modes, unmatched releases, duplicate presses and out-of-bounds coordinates are rejected; ending releases held inputs.
 13. Target unmap releases inputs and cancels the session.
 14. Target disconnect cancels the session without breaking compositor or host input.
-15. A background target can be cropped to a PNG without changing host focus; the image dimensions and pixel content match the target surface.
+15. Asynchronous socket capture produces PNG and raw NumPy images with matching dimensions, orientation, color, and alpha. Invalid chunk bounds and stale IDs are rejected. Session end cancels capture, and capture without a session fails.
 16. Unload/reload restores ordinary routing; sessions can begin on a foreground target with coexistence enabled.
 
 The suite has been validated against Hyprland 0.56.2 (`efb50993780079460b0cbed1363e2166a2de1d9f`) and `41a5d15ac07b3729eda6d26e629f027ab69ed4d9`, using GCC, Aquamarine 0.15.1 and Hyprutils 0.14.2. These are protocol-level tests, not application compatibility tests.
@@ -91,7 +91,19 @@ A session owns pressed-key/button sets, surface-local pointer coordinates and an
 
 Each session starts with `block_input: false`. `hyprauto block-input on|off` changes delivery policy during an active session without restarting it. End/unmap/disconnect reset the policy. A target may already have host focus when the session begins.
 
-`hyprauto screenshot <path>` renders a temporary standalone window snapshot, reads back only the target main-surface rectangle, and writes that crop as a PNG. The render hook forces Hyprland's standalone mode for this synchronous call, excluding window opacity and decorations while preserving alpha from the client surface. Capture fails if the window is not currently renderable. The temporary readback buffer is bounded to 64 megapixels.
+## Capture
+
+`src/capture.cpp` implements a single retained capture job behind the hyprctl socket. `screenshot [path]` returns a monotonically increasing ID after submitting a standalone window render into a window-sized framebuffer and an asynchronous `glReadPixels` into a PBO. Captures reject non-OpenGL renderers and targets with `noscreenshare`. The framebuffer and PBO object are reused. Pixel limits are 16384 per dimension and 64 megapixels.
+
+`screenshot-status <id>` advances the job. A zero-timeout `glClientWaitSync` checks GPU completion; no blocking fence wait or synchronous CPU readback fallback is used. The GPU stage fails after ten seconds when polled. Once signalled, the main thread maps the PBO and copies its pixels. A worker thread converts RGBA to premultiplied BGRA and optionally encodes and writes PNG. Its completion flag publishes pixels or an error to the main thread. Rendering, driver submission, and copying completed pixels still incur compositor-thread costs; PBO submission is not a guarantee of stall-free driver behavior.
+
+Ready status includes width, height, format, size, and path. For raw captures, `screenshot-read <id> <offset> <length>` returns `data:` followed by at most 65536 bytes. Small bounded replies avoid sending an entire image from Hyprland's synchronous socket writer in one response. Integrations must preserve binary bytes, including NUL and whitespace, and strip only the fixed prefix.
+
+`screenshot-release <id>` releases or cancels the job. End, unmap, disconnect, and unload invalidate its ID. An already-running PNG write may finish after cancellation; a new capture remains busy until that worker completes. Unload joins the worker before releasing GL resources, ensuring no plugin code runs after unloading.
+
+The Python controller submits, polls, reads bounded binary chunks, and releases captures using only the hyprctl socket. It removes alpha and unpremultiplies BGR where necessary. No subprocess, PNG, or temporary file is used. Status polling is bounded to fifteen seconds; socket requests have their own timeout.
+
+## Input routing
 
 Delivery uses Hyprland's `CWLKeyboardResource` and `CWLPointerResource` methods. They retain responsibility for serials, button serial tracking, resource lifetime listeners, fixed-point coordinates, capability checks and protocol events. No custom Wayland keyboard/pointer implementation or seat-focus swap is introduced.
 
@@ -108,7 +120,7 @@ This is client-local protocol focus on the existing seat, not a second advertise
 
 End/unload releases held inputs, clears modifiers, sends leave/frame and restores the current host keymap/repeat settings. If host focus is on the target client, ordinary input routing is re-entered. Unmap/destruction cancels without re-entering closing surfaces.
 
-The single-session bypass flag assumes synchronous, single-threaded input dispatch. Concurrent sessions need per-client routing state. Session setup snapshots bound input resources; dynamic rebinding needs additional lifecycle handling. Popup/subsurface targeting, XWayland, IME, pointer constraints, relative-pointer delivery, drag-and-drop, touch and tablet input are outside the current scope. The block policy covers the hooked `wl_keyboard`/`wl_pointer` events, not these additional input protocols. Screenshot output is the standalone-rendered main-surface crop; it does not include the monitor or host cursor, and it ignores Hyprland's window opacity.
+The single-session bypass flag assumes synchronous, single-threaded input dispatch. Concurrent sessions need per-client routing state. Session setup snapshots bound input resources; dynamic rebinding needs additional lifecycle handling. Popup/subsurface targeting, XWayland, IME, pointer constraints, relative-pointer delivery, drag-and-drop, touch and tablet input are outside the current scope. The block policy covers the hooked `wl_keyboard`/`wl_pointer` events, not these additional input protocols. Screenshot output is the standalone window render bounded by the main surface; it may include subsurfaces and popups within those bounds. It does not include the monitor or host cursor, and it ignores Hyprland's window opacity.
 
 ## Backend choice
 

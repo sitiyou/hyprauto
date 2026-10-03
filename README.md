@@ -17,6 +17,10 @@ hyprpm enable hyprauto
 
 The plugin uses private Hyprland hooks, so hyprpm must build it against headers matching your Hyprland revision. After upgrading Hyprland, run `hyprpm update` to rebuild plugins.
 
+All integration uses Hyprland's hyprctl socket interface; no standalone executable is required.
+
+The Python controller requires NumPy and the `hyprauto_ctrl` package available on Python's import path.
+
 When using an isolated instance, pass `hyprctl --instance "$INSTANCE"` and use that instance's `XDG_RUNTIME_DIR`.
 
 ## Usage
@@ -32,7 +36,6 @@ hyprctl hyprauto key 30 up
 hyprctl hyprauto key 42 up
 hyprctl hyprauto button 272 down
 hyprctl hyprauto button 272 up
-hyprctl hyprauto screenshot "$HOME/Pictures/target.png"
 hyprctl hyprauto status
 hyprctl hyprauto end
 ```
@@ -43,12 +46,15 @@ hyprctl hyprauto end
 | `key <code> down\|up` | Press or release a Linux evdev key code. |
 | `move <x> <y>` | Move the automation pointer in coordinates relative to the target's main surface. |
 | `button <code> down\|up` | Press or release a mouse button. |
-| `screenshot <path>` | Save the target's rendered main surface as a PNG; quote paths containing spaces. |
+| `screenshot [path]` | Submit a screenshot and return its ID as JSON. With a path, save a PNG; without one, retain raw pixels. |
+| `screenshot-status <id>` | Advance the capture and return `pending`, `ready`, or `failed` state as JSON. |
+| `screenshot-read <id> <offset> <length>` | Read up to 65536 raw pixel bytes through the socket, prefixed by `data:`. |
+| `screenshot-release <id>` | Release or cancel the capture. |
 | `block-input on\|off` | Block or allow user keyboard and pointer events to the target during an active session. |
 | `status` | Return session and host input state as JSON, including `block_input`. |
 | `end` | Release automation input and end the session; safe to call repeatedly. |
 
-`42` is left Shift, `30` is A, and `272` is the left mouse button. Movement coordinates must be inside the target surface. Commands return `ok` or `error: ...`, except `status`. Duplicate presses, unmatched releases, and invalid arguments are rejected.
+`42` is left Shift, `30` is A, and `272` is the left mouse button. Movement coordinates must be inside the target surface. Commands return `ok` or `error: ...`, except JSON responses from `status`, `screenshot`, and `screenshot-status`, and binary responses from `screenshot-read`. Duplicate presses, unmatched releases, and invalid arguments are rejected.
 
 ### User and automation input
 
@@ -63,9 +69,23 @@ hyprctl hyprauto block-input off
 
 Blocking filters only user events sent to the target client's `wl_keyboard` and `wl_pointer` resources. It does not affect automation, other clients, host focus, physical cursor movement, or Hyprland key bindings. The policy resets when the session ends.
 
-A screenshot requires an active session and a target currently renderable by Hyprland. The PNG contains the target main-surface crop, not the full monitor or host cursor. Hyprland window opacity and decorations are excluded; alpha in the client surface itself is preserved.
-
 User and automation events share the target client's protocol resources; application-level state isolation is not guaranteed. Overlapping presses, releases, and interleaved events may affect the application, and users are responsible for the consequences. Toggling the block policy does not replay physical input state; release held user keys and buttons before changing it.
+
+### Screenshots
+
+A screenshot requires an active session, a mapped target, and Hyprland's OpenGL renderer. Targets with `noscreenshare` enabled are rejected. The image is confined to the target's main-surface bounds, not the monitor or host cursor; subsurfaces and popups within those bounds may be included. Hyprland window opacity and decorations are excluded; alpha in the client surface itself is preserved.
+
+To save a PNG during an active session:
+
+```sh
+hyprctl hyprauto screenshot "$HOME/Pictures/target.png"
+hyprctl hyprauto screenshot-status 1
+hyprctl hyprauto screenshot-release 1
+```
+
+Replace `1` with the ID returned by `screenshot`. Repeat `screenshot-status` until its state is `ready` before releasing the capture or ending the session. A `failed` response includes an error. Only one capture may be retained at a time; release it before submitting another. Ending a session invalidates its capture. PNG encoding already in progress may finish after cancellation.
+
+For socket integrations, omit the path to receive raw pixels instead of encoding PNG. A ready response includes `width`, `height`, `format: "BGRA"`, and `size`. Read exactly `size` bytes in chunks with `screenshot-read`, removing the five-byte `data:` prefix from each response. Offsets and lengths are in bytes. Pixels are top-to-bottom, tightly packed, and premultiplied by alpha.
 
 ## Uninstallation
 
@@ -97,6 +117,6 @@ controller.set_target("address:0x...").wait()
 controller.close()
 ```
 
-Screenshots are returned as NumPy BGR images and the latest capture is available from `controller.cached_image`. Jobs expose `succeeded` and `error`. The plugin currently permits one active session per Hyprland instance, so selecting another target switches the active session; it does not create simultaneous sessions. `close()` ends the active session without unloading the plugin.
+Screenshots are returned directly as NumPy BGR images without PNG encoding, decoding, or temporary files. Capture submission, polling, pixel transfer, and release all use the hyprctl socket; the latest capture is available from `controller.cached_image`. Jobs expose `succeeded` and `error`. The plugin currently permits one active session per Hyprland instance, so selecting another target switches the active session; it does not create simultaneous sessions. `close()` ends the active session without unloading the plugin.
 
 The project includes `hyprpm.toml` for building and managing the plugin with hyprpm. See the [development guide](docs/development.md) for build, isolated headless testing, and implementation details.

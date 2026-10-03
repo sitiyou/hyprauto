@@ -5,6 +5,7 @@ import shutil
 import socket
 import struct
 import subprocess
+import sys
 import tempfile
 import threading
 import time
@@ -170,7 +171,7 @@ def run(binary, build_dir, plugin):
             )
             ipc = wait_for(lambda: next(iter(runtime.glob("hypr/*/.socket.sock")), None), "headless IPC")
 
-            def command(request):
+            def raw_command(request):
                 with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as connection:
                     connection.settimeout(5)
                     connection.connect(str(ipc))
@@ -178,7 +179,17 @@ def run(binary, build_dir, plugin):
                     chunks = []
                     while chunk := connection.recv(65536):
                         chunks.append(chunk)
-                return b"".join(chunks).decode().strip()
+                return b"".join(chunks)
+
+            def command(request):
+                return raw_command(request).decode().strip()
+
+            def capture_result(capture_id):
+                def ready():
+                    result = json.loads(command(f"/hyprauto screenshot-status {capture_id}"))
+                    assert result["state"] in ("pending", "ready"), result
+                    return result if result["state"] == "ready" else None
+                return wait_for(ready, "asynchronous screenshot")
 
             def ok(request):
                 response = command(request)
@@ -227,6 +238,7 @@ def run(binary, build_dir, plugin):
             displays = [p for p in runtime.glob("wayland-*") if not p.name.endswith(".lock")]
             assert len(displays) == 1
             env["WAYLAND_DISPLAY"] = displays[0].name
+            env["HYPRLAND_INSTANCE_SIGNATURE"] = ipc.parent.name
             ok(f"/plugin load {build_dir / 'hyprtestplugin.so'}")
             ok(f"/plugin load {plugin}")
             if not json.loads(command("j/monitors")):
@@ -264,12 +276,68 @@ def run(binary, build_dir, plugin):
             assert "pointer-enter 1.000 1.000" in events, events
             assert "active 1" not in events, events
             screenshot = runtime / "target capture.png"
-            captured = command(f'/hyprauto screenshot "{screenshot}"')
-            assert captured == "ok: 320x240 " + str(screenshot), captured
+            capture_host = status()["host"]
+            capture_id = json.loads(command(f'/hyprauto screenshot "{screenshot}"'))["id"]
+            assert command("/hyprauto screenshot").startswith("error: screenshot is busy")
+            result = capture_result(capture_id)
+            assert result["width"] == 320 and result["height"] == 240 and result["path"] == str(screenshot), result
+            auto(f"screenshot-release {capture_id}")
+            failed_id = json.loads(command(f'/hyprauto screenshot "{runtime / "absent" / "capture.png"}"'))["id"]
+            def failed_capture():
+                result = json.loads(command(f"/hyprauto screenshot-status {failed_id}"))
+                return result if result["state"] != "pending" else None
+            failure = wait_for(failed_capture, "PNG write failure")
+            assert failure["state"] == "failed" and failure["error"], failure
+            auto(f"screenshot-release {failed_id}")
             assert png_size(screenshot) == (320, 240)
             assert png_pixel(screenshot, 160, 120) == (48, 80, 112, 255)
-            check("background screenshot crops target pixels and ignores Hyprland window opacity")
+            assert png_pixel(screenshot, 16, 16) == (128, 64, 32, 128)
+            assert png_pixel(screenshot, 304, 224) == (32, 64, 128, 255)
+            assert status()["host"] == capture_host, (capture_host, status()["host"])
+            check("socket PNG capture crops target pixels and ignores Hyprland window opacity")
             check("background session enters once without changing host focus or activation")
+            auto("end")
+            python_capture = subprocess.run(
+                [sys.executable, "-c", """
+from hyprauto_ctrl import HyprAutoController
+import numpy as np
+controller = HyprAutoController()
+try:
+    connection = controller.post_connection('class:target').wait(10)
+    assert connection.succeeded, connection.error
+    for _ in range(3):
+        job = controller.post_screencap().wait(20)
+        assert job.succeeded, job.error
+        image = job.get()
+        assert image.shape == (240, 320, 3) and image.dtype == np.uint8
+        assert image[120, 160].tolist() == [112, 80, 48], image[120, 160]
+        assert image[16, 16].tolist() == [32, 64, 128], image[16, 16]
+        assert image[224, 304].tolist() == [128, 64, 32], image[224, 304]
+        assert np.array_equal(controller.cached_image, image)
+finally:
+    controller.close()
+"""], env=env, cwd=TESTS.parent, capture_output=True, text=True, timeout=70,
+            )
+            assert python_capture.returncode == 0, python_capture.stderr
+            assert not status()["active"]
+            assert command("/hyprauto screenshot").startswith("error: no active session")
+            auto("begin class:target")
+            capture_id = json.loads(command("/hyprauto screenshot"))["id"]
+            result = capture_result(capture_id)
+            assert result["format"] == "BGRA" and result["size"] == 320 * 240 * 4, result
+            chunk = raw_command(f"/hyprauto screenshot-read {capture_id} 0 65536")
+            assert len(chunk) == 65541 and chunk.startswith(b"data:"), len(chunk)
+            assert chunk[5:9] == bytes((16, 32, 64, 128)), chunk[:9]
+            for offset, length in ((0, 0), (0, 65537), (result["size"], 1), (-1, 4)):
+                assert command(f"/hyprauto screenshot-read {capture_id} {offset} {length}").startswith("error:")
+            assert command(f"/hyprauto screenshot-status {capture_id + 1}").startswith("error:")
+            auto(f"screenshot-release {capture_id}")
+            assert command(f"/hyprauto screenshot-read {capture_id} 0 4").startswith("error:")
+            capture_id = json.loads(command("/hyprauto screenshot"))["id"]
+            auto("end")
+            auto("begin class:target")
+            assert command(f"/hyprauto screenshot-status {capture_id}").startswith("error:")
+            check("raw socket chunks and NumPy captures preserve alpha and orientation; stale jobs and invalid reads are rejected")
 
             auto("key 42 down")
             auto("key 30 down")
@@ -440,7 +508,8 @@ def run(binary, build_dir, plugin):
             check("ending a blocked foreground session restores ordinary host routing")
 
             for request in ("key 30 up", "button 272 up", "key -1 down", "button 1 down", "move -1 10", "move 999999 10",
-                            "block-input", "block-input yes", "block-input on extra", "screenshot", "screenshot one two"):
+                            "block-input", "block-input yes", "block-input on extra", "screenshot one two",
+                            "screenshot-status", "screenshot-release", "screenshot-read 1", 'screenshot ""', 'screenshot "unterminated'):
                 assert command("/hyprauto " + request).startswith("error:"), request
             auto("key 30 down")
             assert command("/hyprauto key 30 down").startswith("error:")
@@ -495,6 +564,7 @@ def run(binary, build_dir, plugin):
             auto("key 30 down")
             auto("button 272 down")
             unload_start = len(target.sync())
+            pending_capture = json.loads(command("/hyprauto screenshot"))["id"]
             ok(f"/plugin unload {plugin}")
             sync_all()
             events = target.events[unload_start:]
@@ -506,6 +576,7 @@ def run(binary, build_dir, plugin):
             target.sync()
             assert any(e.startswith("key 48 1 ") for e in target.events)
             unchanged(lambda: auto("begin class:target"))
+            assert command(f"/hyprauto screenshot-status {pending_capture}").startswith("error:")
             assert status()["active"] and not status()["block_input"]
             foreground_start = len(target.sync())
             host_key(48, True)

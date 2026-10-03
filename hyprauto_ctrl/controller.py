@@ -3,11 +3,9 @@ from __future__ import annotations
 import json
 import os
 import socket
-import struct
-import tempfile
 import threading
 import time
-import zlib
+from contextlib import suppress
 from pathlib import Path
 from typing import Any
 
@@ -78,7 +76,7 @@ class HyprAutoController:
         self._socket_path: Path | None = None
         self._cached_image: np.ndarray | None = None
 
-    def _command(self, *args: str) -> str:
+    def _request(self, *args: str) -> bytes:
         if self._socket_path is None:
             raise RuntimeError("not connected; call post_connection() first")
         request = ("/hyprauto " + " ".join(args)).encode()
@@ -92,10 +90,12 @@ class HyprAutoController:
                     response.extend(chunk)
         except OSError as exc:
             raise RuntimeError(f"Hyprland IPC request failed: {exc}") from exc
-        output = response.decode(errors="replace").strip()
-        if output.startswith("error:"):
-            raise RuntimeError(output)
-        return output
+        if response.startswith(b"error:"):
+            raise RuntimeError(response.decode(errors="replace").strip())
+        return bytes(response)
+
+    def _command(self, *args: str) -> str:
+        return self._request(*args).decode(errors="replace").strip()
 
     def _submit(self, action, result: bool = False) -> Job:
         job = JobWithResult() if result else Job._pending()
@@ -207,10 +207,45 @@ class HyprAutoController:
 
     def post_screencap(self) -> JobWithResult:
         def capture() -> np.ndarray:
-            with tempfile.TemporaryDirectory(prefix="hyprauto-") as directory:
-                path = Path(directory) / "capture.png"
-                self._command("screenshot", json.dumps(str(path)))
-                image = _decode_png(path.read_bytes())
+            if not self._connected:
+                raise RuntimeError("no active session")
+            capture_id = str(json.loads(self._command("screenshot"))["id"])
+            try:
+                deadline = time.monotonic() + 15
+                while True:
+                    info = json.loads(self._command("screenshot-status", capture_id))
+                    if info["state"] == "ready":
+                        break
+                    if info["state"] == "failed":
+                        raise RuntimeError(info["error"])
+                    if info["state"] != "pending" or time.monotonic() >= deadline:
+                        raise RuntimeError("screenshot failed or timed out")
+                    time.sleep(0.002)
+                width, height = info["width"], info["height"]
+                if (
+                    not isinstance(width, int) or not isinstance(height, int)
+                    or not (0 < width <= 16384 and 0 < height <= 16384)
+                    or width * height > 67108864
+                    or info["format"] != "BGRA" or info["size"] != width * height * 4
+                ):
+                    raise RuntimeError("invalid capture metadata")
+                data = bytearray()
+                while len(data) < info["size"]:
+                    if time.monotonic() >= deadline:
+                        raise RuntimeError("screenshot pixel transfer timed out")
+                    length = min(65536, info["size"] - len(data))
+                    chunk = self._request("screenshot-read", capture_id, str(len(data)), str(length))
+                    if not chunk.startswith(b"data:") or len(chunk) != length + 5:
+                        raise RuntimeError("invalid screenshot pixel chunk")
+                    data.extend(memoryview(chunk)[5:])
+                pixels = np.frombuffer(data, dtype=np.uint8).reshape(height, width, 4)
+                image = pixels[:, :, :3].copy()
+                alpha = pixels[:, :, 3:4]
+                if np.any(alpha != 255):
+                    image = np.minimum((image.astype(np.uint16) * 255 + alpha // 2) // np.maximum(alpha, 1), 255).astype(np.uint8)
+            finally:
+                with suppress(RuntimeError):
+                    self._command("screenshot-release", capture_id)
             self._cached_image = image
             return image
 
@@ -235,63 +270,3 @@ class HyprAutoController:
                 self._command("end")
                 self._connected = False
             self._socket_path = None
-
-
-def _decode_png(data: bytes) -> np.ndarray:
-    if data[:8] != b"\x89PNG\r\n\x1a\n":
-        raise RuntimeError("invalid PNG screenshot")
-    offset = 8
-    width = height = depth = color = 0
-    compression = filtering = interlace = 0
-    compressed = bytearray()
-    while offset + 12 <= len(data):
-        length = struct.unpack_from(">I", data, offset)[0]
-        kind = data[offset + 4 : offset + 8]
-        chunk = data[offset + 8 : offset + 8 + length]
-        if len(chunk) != length:
-            raise RuntimeError("truncated PNG screenshot")
-        if kind == b"IHDR":
-            width, height, depth, color, compression, filtering, interlace = struct.unpack(">IIBBBBB", chunk)
-        elif kind == b"IDAT":
-            compressed.extend(chunk)
-        elif kind == b"IEND":
-            break
-        offset += length + 12
-    if depth != 8 or color not in (2, 6) or compression or filtering or interlace:
-        raise RuntimeError("unsupported PNG screenshot format")
-    if width < 1 or height < 1:
-        raise RuntimeError("PNG screenshot has no valid image header")
-    channels = 4 if color == 6 else 3
-    stride = width * channels
-    raw = zlib.decompress(compressed)
-    if len(raw) != height * (stride + 1):
-        raise RuntimeError("invalid PNG image data length")
-    rows = np.empty((height, stride), dtype=np.uint8)
-    source = memoryview(raw)
-    previous = np.zeros(stride, dtype=np.uint8)
-    for y in range(height):
-        start = y * (stride + 1)
-        filter_type = source[start]
-        row = np.frombuffer(source[start + 1 : start + stride + 1], dtype=np.uint8).copy()
-        left = np.zeros(stride, dtype=np.uint8)
-        above_left = np.zeros(stride, dtype=np.uint8)
-        left[channels:] = row[:-channels]
-        above_left[channels:] = previous[:-channels]
-        if filter_type == 1:
-            row = (row.astype(np.uint16) + left).astype(np.uint8)
-        elif filter_type == 2:
-            row = (row.astype(np.uint16) + previous).astype(np.uint8)
-        elif filter_type == 3:
-            row = (row.astype(np.uint16) + ((left.astype(np.uint16) + previous) // 2)).astype(np.uint8)
-        elif filter_type == 4:
-            estimate = left.astype(np.int16) + previous.astype(np.int16) - above_left.astype(np.int16)
-            distances = np.stack((abs(estimate - left), abs(estimate - previous), abs(estimate - above_left)))
-            predictors = np.stack((left, previous, above_left))
-            predictor = np.take_along_axis(predictors, distances.argmin(axis=0)[None, :], axis=0)[0]
-            row = (row.astype(np.uint16) + predictor).astype(np.uint8)
-        elif filter_type != 0:
-            raise RuntimeError(f"unsupported PNG filter {filter_type}")
-        rows[y] = row
-        previous = row
-    pixels = rows.reshape(height, width, channels)
-    return pixels[:, :, 2::-1].copy()

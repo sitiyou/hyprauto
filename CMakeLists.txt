@@ -3,7 +3,8 @@ project(hyprauto VERSION 0.1.0 LANGUAGES C CXX)
 
 include(GNUInstallDirs)
 find_package(PkgConfig REQUIRED)
-pkg_check_modules(DEPS REQUIRED IMPORTED_TARGET xkbcommon wayland-server pixman-1 libdrm pangocairo libinput libudev nlohmann_json)
+pkg_check_modules(DEPS REQUIRED IMPORTED_TARGET xkbcommon wayland-server pixman-1 libdrm pangocairo libinput libudev nlohmann_json glesv2)
+find_package(Threads REQUIRED)
 
 set(HYPRLAND_SOURCE "" CACHE PATH "Matching configured Hyprland checkout, overriding installed headers")
 option(HYPRAUTO_BUILD_TESTS "Build the isolated headless integration harness" OFF)
@@ -23,11 +24,11 @@ else()
 endif()
 target_link_libraries(hyprland_headers INTERFACE PkgConfig::DEPS)
 
-add_library(hyprauto MODULE src/main.cpp)
+add_library(hyprauto MODULE src/main.cpp src/capture.cpp)
 set_target_properties(hyprauto PROPERTIES PREFIX "" CXX_STANDARD 23 CXX_STANDARD_REQUIRED YES)
 target_compile_definitions(hyprauto PRIVATE HYPRAUTO_VERSION="${PROJECT_VERSION}")
 target_compile_options(hyprauto PRIVATE -Wall -Wextra -Wno-unused-parameter -Wno-missing-field-initializers)
-target_link_libraries(hyprauto PRIVATE hyprland_headers)
+target_link_libraries(hyprauto PRIVATE hyprland_headers Threads::Threads)
 install(TARGETS hyprauto LIBRARY DESTINATION "${CMAKE_INSTALL_LIBDIR}/hyprland")
 
 configure_file(cmake/uninstall.cmake.in "${CMAKE_CURRENT_BINARY_DIR}/uninstall.cmake" @ONLY)

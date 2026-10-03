@@ -38,8 +38,15 @@ static void                            configure_surface(void* data, struct xdg_
         exit(2);
     for (size_t i = 0; i < size / 4; ++i)
         pixels[i] = 0xff305070;
+    for (int y = 0; y < 32 && y < height; ++y)
+        for (int x = 0; x < 32 && x < width; ++x)
+            pixels[(size_t)y * width + x] = 0x80402010;
+    for (int y = height - 32; y < height; ++y)
+        for (int x = width - 32; x < width; ++x)
+            if (x >= 0 && y >= 0)
+                pixels[(size_t)y * width + x] = 0xff204080;
     struct wl_shm_pool* pool   = wl_shm_create_pool(shm, fd, size);
-    struct wl_buffer*   buffer = wl_shm_pool_create_buffer(pool, 0, width, height, width * 4, WL_SHM_FORMAT_XRGB8888);
+    struct wl_buffer*   buffer = wl_shm_pool_create_buffer(pool, 0, width, height, width * 4, WL_SHM_FORMAT_ARGB8888);
     wl_buffer_add_listener(buffer, &buffer_listener, NULL);
     wl_shm_pool_destroy(pool);
     munmap(pixels, size);
