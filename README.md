@@ -8,42 +8,20 @@ Automation maintains its own key/button state, modifiers, keyboard layout, and p
 
 ## Installation
 
-Requirements include CMake, pkg-config, a C++23 compiler, and development files for Hyprland, xkbcommon, Wayland, Pixman, libdrm, Pango/Cairo, libinput, libudev, and nlohmann-json.
+Install and enable the plugin with [hyprpm](https://wiki.hypr.land/Plugins/Using-Plugins/):
 
 ```sh
-cd ~/dev/hyprauto
-make
-make install
+hyprpm add https://github.com/sitiyou/hyprauto.git
+hyprpm enable hyprauto
 ```
 
-The plugin is installed to `~/.local/lib/hyprland/hyprauto.so` by default. Installation does not load the plugin or modify Hyprland configuration. To choose another prefix:
+The plugin uses private Hyprland hooks, so hyprpm must build it against headers matching your Hyprland revision. After upgrading Hyprland, run `hyprpm update` to rebuild plugins.
+
+To uninstall:
 
 ```sh
-make install PREFIX=/usr/local
-```
-
-After upgrading Hyprland or its dependencies, rebuild and retest. Development headers must match the running Hyprland revision; incompatible revisions or hook installation failures prevent the plugin from loading.
-
-Before replacing a plugin that is currently loaded, end its session and unload it:
-
-```sh
-hyprctl hyprauto end
-hyprctl plugin unload "$HOME/.local/lib/hyprland/hyprauto.so"
-make install
-```
-
-## Loading
-
-Load manually:
-
-```sh
-hyprctl plugin load "$HOME/.local/lib/hyprland/hyprauto.so"
-```
-
-To load at startup, add this to your Hyprland Lua configuration:
-
-```lua
-hl.plugin.load(os.getenv("HOME") .. "/.local/lib/hyprland/hyprauto.so")
+hyprpm disable hyprauto
+hyprpm remove https://github.com/sitiyou/hyprauto.git
 ```
 
 When using an isolated instance, pass `hyprctl --instance "$INSTANCE"` and use that instance's `XDG_RUNTIME_DIR`.
