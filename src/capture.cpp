@@ -2,6 +2,8 @@
 #include <src/render/Renderer.hpp>
 #include <src/render/pass/SurfacePassElement.hpp>
 #include <src/protocols/core/Compositor.hpp>
+#include <src/protocols/XDGShell.hpp>
+#include <src/xwayland/XSurface.hpp>
 #include <src/desktop/view/Popup.hpp>
 #include <src/helpers/cm/ColorManagement.hpp>
 #include <hyprutils/utils/ScopeGuard.hpp>
@@ -123,10 +125,16 @@ namespace Hyprauto::Capture {
                     nullptr);
             };
             addSurfaceTree(window->wlSurface()->resource(), monitor->m_position, false, true);
-            const auto geometry = window->backend().geometry().box;
-            window->popupHead()->breadthfirst(
+            const auto geometry = [&] {
+                if (const auto surface = window->m_xdgSurface.lock())
+                    return surface->m_current.geometry;
+                if (const auto surface = window->m_xwaylandSurface.lock())
+                    return surface->m_geometry;
+                return CBox{};
+            }();
+            window->m_popupHead->breadthfirst(
                 [&](SP<Desktop::View::CPopup> popup, void*) {
-                    if (!popup->mapped() || !popup->acceptsInput() || !popup->alphaNonZero())
+                    if (!popup->m_mapped)
                         return;
                     addSurfaceTree(popup->wlSurface()->resource(), monitor->m_position - geometry.pos() + popup->coordsRelativeToParent(), true, false);
                 },

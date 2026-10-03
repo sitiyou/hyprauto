@@ -153,7 +153,7 @@ class HyprAutoController:
     def post_key_up(self, key: int) -> Job:
         return self._submit(lambda: self._command("key", str(key), "up"))
 
-    def post_click_key(self, key: int, hold_ms: int = 50) -> Job:
+    def post_click_key(self, key: int, hold_ms: int = 80) -> Job:
         if hold_ms < 0:
             return Job(error="hold duration must not be negative")
 
