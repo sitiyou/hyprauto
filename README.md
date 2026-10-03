@@ -1,8 +1,8 @@
 # hyprauto
 
-A Hyprland plugin for sending keyboard and pointer input to a selected native Wayland toplevel. Automation sessions are independent of host focus and do not move the host cursor.
+A Hyprland plugin for sending keyboard and pointer input to native Wayland toplevels. Multiple automation sessions can control different clients simultaneously, independently of host focus and without moving the host cursor.
 
-Automation maintains its own key/button state, modifiers, keyboard layout, and pointer coordinates. By default, user input and automation input can coexist. A session can optionally block user input to its target client. Host focus changes do not interrupt the session; ending the session, closing the target, or unloading the plugin releases automation input.
+Each session has its own target, key/button state, modifiers, keyboard layout, pointer coordinates, input-blocking policy and screenshot job. A session can select one target at a time, and each Wayland client can belong to only one session.
 
 > This plugin runs inside the compositor and uses private Hyprland hooks. Build it against the headers for the running Hyprland revision and test it in an isolated instance first. Application compatibility is not guaranteed.
 
@@ -15,77 +15,77 @@ hyprpm add https://github.com/sitiyou/hyprauto.git
 hyprpm enable hyprauto
 ```
 
-The plugin uses private Hyprland hooks, so hyprpm must build it against headers matching your Hyprland revision. After upgrading Hyprland, run `hyprpm update` to rebuild plugins.
+After upgrading Hyprland, run `hyprpm update` to rebuild plugins against matching headers.
 
-All integration uses Hyprland's hyprctl socket interface; no standalone executable is required.
-
-The Python controller requires NumPy and the `hyprauto_ctrl` package available on Python's import path.
-
-When using an isolated instance, pass `hyprctl --instance "$INSTANCE"` and use that instance's `XDG_RUNTIME_DIR`.
+The Python controller requires NumPy and the `hyprauto_ctrl` package available on Python's import path. The plugin provides its own Unix socket; no external service, helper executable or subprocess is required for automation.
 
 ## Usage
 
-Select a native Wayland client with bound keyboard and pointer resources. It can be in the foreground or background; starting a session does not change host focus.
+Use one controller for each automation session:
 
-```sh
-hyprctl hyprauto begin class:target
-hyprctl hyprauto move 40 50
-hyprctl hyprauto key 42 down
-hyprctl hyprauto key 30 down
-hyprctl hyprauto key 30 up
-hyprctl hyprauto key 42 up
-hyprctl hyprauto button 272 down
-hyprctl hyprauto button 272 up
-hyprctl hyprauto status
-hyprctl hyprauto end
+```python
+from hyprauto_ctrl import HyprAutoController
+
+with HyprAutoController() as first, HyprAutoController() as second:
+    for controller, target in ((first, "class:target-a"), (second, "class:target-b")):
+        job = controller.post_connection(target).wait()
+        if not job.succeeded:
+            raise RuntimeError(job.error)
+
+    first.post_click(40, 50).wait()
+    second.post_click_key(30).wait()
+    image = first.post_screencap().wait().get()
+    print(first.session_id, second.session_id)
 ```
 
-| Command | Description |
-| --- | --- |
-| `begin <selector>` | Start a session using a Hyprland window selector, such as `class:target` or `address:0x...`. |
-| `key <code> down\|up` | Press or release a Linux evdev key code. |
-| `move <x> <y>` | Move the automation pointer in coordinates relative to the target's main surface. |
-| `button <code> down\|up` | Press or release a mouse button. |
-| `screenshot [path]` | Submit a screenshot and return its ID as JSON. With a path, save a PNG; without one, retain raw pixels. |
-| `screenshot-status <id>` | Advance the capture and return `pending`, `ready`, or `failed` state as JSON. |
-| `screenshot-read <id> <offset> <length>` | Read up to 65536 raw pixel bytes through the socket, prefixed by `data:`. |
-| `screenshot-release <id>` | Release or cancel the capture. |
-| `block-input on\|off` | Block or allow user keyboard and pointer events to the target during an active session. |
-| `status` | Return session and host input state as JSON, including `block_input`. |
-| `end` | Release automation input and end the session; safe to call repeatedly. |
+Pass `instance="instance-signature"` at construction when selecting a particular Hyprland instance. Otherwise the controller uses `HYPRLAND_INSTANCE_SIGNATURE`. The instance's runtime directory is resolved under `XDG_RUNTIME_DIR`.
 
-`42` is left Shift, `30` is A, and `272` is the left mouse button. Movement coordinates must be inside the target surface. Commands return `ok` or `error: ...`, except JSON responses from `status`, `screenshot`, and `screenshot-status`, and binary responses from `screenshot-read`. Duplicate presses, unmatched releases, and invalid arguments are rejected.
+`post_connection()` creates a session, optionally selecting a target. `set_target(selector)` switches only that controller's target. Select a mapped native Wayland window with bound keyboard and pointer resources, using selectors such as `class:target` or `address:0x...`. Selecting an unavailable or occupied target fails without changing the existing target or held input. Selecting the current target again does not reset it.
+
+Jobs expose `succeeded` and `error`; always check them when handling failures. `post_click_key(key, hold_ms=50)` uses Linux evdev key codes and holds the key for 50 ms by default. For example, `42` is left Shift and `30` is A. Mouse contacts `0`, `1` and `2` mean left, right and middle button. Coordinates are relative to the target's main surface and must remain inside it.
+
+### Cleanup and connection failures
+
+Use a context manager or call `close()` to release input and end your session. This does not affect other sessions or unload the plugin.
+
+A lost socket connection immediately releases that session's held input and screenshots. A 30-second lease also cleans up clients that remain connected but stop responding. Python automatically sends a heartbeat every five seconds, including while idle. Debugging pauses or process suspension exceeding the lease can end the session.
+
+Closing or unmapping a target releases its input and invalidates its screenshot, but leaves the session connected so it can select another target. Plugin unload closes all sessions and removes its socket. Connection failures are reported explicitly: the controller does not automatically reconnect or replay input. Call `post_connection()` again to create a new session.
 
 ### User and automation input
 
-Each session starts with `block_input: false`. When the user interacts with the target client, keyboard, modifier, pointer-motion, button, and scroll events are delivered normally. Automation continues while the user visits or leaves the target. Before injecting a key or button, automation reapplies its own modifiers or pointer position.
+By default, user input and automation input can coexist. Host focus changes do not interrupt automation. Before injecting a key or button, automation reapplies its own modifiers or pointer position.
 
-To block user input:
+To block user input to a session's target:
 
-```sh
-hyprctl hyprauto block-input on
-hyprctl hyprauto block-input off
+```python
+controller.post_block_input(True).wait()
+controller.post_block_input(False).wait()
 ```
 
-Blocking filters only user events sent to the target client's `wl_keyboard` and `wl_pointer` resources. It does not affect automation, other clients, host focus, physical cursor movement, or Hyprland key bindings. The policy resets when the session ends.
+Blocking filters user keyboard and pointer events sent to that Wayland client. It does not affect automation, other clients, host focus, physical cursor movement or Hyprland key bindings. The policy resets when the target binding ends.
 
-User and automation events share the target client's protocol resources; application-level state isolation is not guaranteed. Overlapping presses, releases, and interleaved events may affect the application, and users are responsible for the consequences. Toggling the block policy does not replay physical input state; release held user keys and buttons before changing it.
+User and automation events share the target client's protocol resources; application-level state isolation is not guaranteed. Overlapping presses, releases and interleaved events may affect the application. Toggling the block policy does not replay physical input state; release held user keys and buttons before changing it.
 
 ### Screenshots
 
-A screenshot requires an active session, a mapped target, and Hyprland's OpenGL renderer. Targets with `noscreenshare` enabled are rejected. The image is confined to the target's main-surface bounds, not the monitor or host cursor; subsurfaces and popups within those bounds may be included. Hyprland window opacity and decorations are excluded; alpha in the client surface itself is preserved.
+`post_screencap()` returns a NumPy BGR image directly, without PNG encoding, decoding or temporary files. The latest image is available from `controller.cached_image`.
 
-To save a PNG during an active session:
+Each session can retain one capture at a time; different sessions can capture independently. Screenshots require a mapped target and Hyprland's OpenGL renderer. Targets with `noscreenshare` enabled are rejected. The image is confined to the main-surface bounds, not the monitor or host cursor; subsurfaces and popups within those bounds may be included. Hyprland window opacity and decorations are excluded. Client-surface alpha is preserved by the socket protocol and removed by the Python controller.
+
+## Management with hyprctl
 
 ```sh
-hyprctl hyprauto screenshot "$HOME/Pictures/target.png"
-hyprctl hyprauto screenshot-status 1
-hyprctl hyprauto screenshot-release 1
+hyprctl hyprauto status
+hyprctl hyprauto sessions
+hyprctl hyprauto end <session-id>
 ```
 
-Replace `1` with the ID returned by `screenshot`. Repeat `screenshot-status` until its state is `ready` before releasing the capture or ending the session. A `failed` response includes an error. Only one capture may be retained at a time; release it before submitting another. Ending a session invalidates its capture. PNG encoding already in progress may finish after cancellation.
+`status` reports the socket address, protocol version, session count and lease duration. `sessions` lists session IDs, targets and input state. `end <session-id>` forcibly disconnects that session and releases its input.
 
-For socket integrations, omit the path to receive raw pixels instead of encoding PNG. A ready response includes `width`, `height`, `format: "BGRA"`, and `size`. Read exactly `size` bytes in chunks with `screenshot-read`, removing the five-byte `data:` prefix from each response. Offsets and lengths are in bytes. Pixels are top-to-bottom, tightly packed, and premultiplied by alpha.
+Target selection, input, screenshots and normal session cleanup use the dedicated socket, not hyprctl. For other integrations, see the [socket protocol](docs/socket-protocol.md).
+
+When using an isolated instance, pass `hyprctl --instance "$INSTANCE"` and use that instance's `XDG_RUNTIME_DIR`.
 
 ## Uninstallation
 
@@ -96,27 +96,9 @@ hyprpm remove https://github.com/sitiyou/hyprauto.git
 
 ## Scope
 
-- One session at a time; native Wayland toplevels; coordinates relative to the main surface.
-- The target main surface retains protocol focus on all bound keyboard and pointer resources. This is not a second seat and does not isolate multiple windows belonging to the same client. User input for another window on that client connection may reach the automation target.
-- XWayland, IME, popup/subsurface hit-testing, pointer-lock/relative-pointer, touch/tablet, scroll injection, drag-and-drop, and resource rebinding during a session are not supported.
-- Protocol behavior is tested with the included client. Compatibility with GTK, Qt, browsers, and games requires separate testing.
+- Multiple sessions for different native Wayland clients; one target per session and one session per client. At most 64 connections are accepted.
+- The target main surface retains protocol focus on all bound keyboard and pointer resources. This is not a second seat and does not isolate multiple windows belonging to the same Wayland client. User input for another window on that connection may reach the automation target.
+- The socket is local and restricted to the user running Hyprland. Cross-user and network access are not supported.
+- XWayland, IME, popup/subsurface hit-testing, pointer-lock/relative-pointer, touch/tablet, scroll injection, drag-and-drop and resource rebinding during a target binding are not supported.
+- Protocol behavior is tested with the included client. Compatibility with GTK, Qt, browsers and games requires separate testing.
 
-## Python controller
-
-`hyprauto_ctrl` provides an asynchronous Python controller using the same core method names as MaaFramework. Pass `instance` at construction; when omitted, it uses `HYPRLAND_INSTANCE_SIGNATURE` from the environment. Pass the target selector to `post_connection()` or change the selected window later with `set_target()`. Target changes replace the current session. `post_click_key(key, hold_ms=50)` holds the key for 50 ms by default. The runtime socket is resolved under `XDG_RUNTIME_DIR`.
-
-```python
-from hyprauto_ctrl import HyprAutoController
-
-controller = HyprAutoController(instance="instance-signature")
-controller.post_connection("class:target").wait()
-controller.post_click(40, 50).wait()
-controller.post_click_key(30).wait()
-image = controller.post_screencap().wait().get()
-controller.set_target("address:0x...").wait()
-controller.close()
-```
-
-Screenshots are returned directly as NumPy BGR images without PNG encoding, decoding, or temporary files. Capture submission, polling, pixel transfer, and release all use the hyprctl socket; the latest capture is available from `controller.cached_image`. Jobs expose `succeeded` and `error`. The plugin currently permits one active session per Hyprland instance, so selecting another target switches the active session; it does not create simultaneous sessions. `close()` ends the active session without unloading the plugin.
-
-The project includes `hyprpm.toml` for building and managing the plugin with hyprpm. See the [development guide](docs/development.md) for build, isolated headless testing, and implementation details.

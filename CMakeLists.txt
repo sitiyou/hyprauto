@@ -24,7 +24,7 @@ else()
 endif()
 target_link_libraries(hyprland_headers INTERFACE PkgConfig::DEPS)
 
-add_library(hyprauto MODULE src/main.cpp src/capture.cpp)
+add_library(hyprauto MODULE src/main.cpp src/capture.cpp src/socket.cpp)
 set_target_properties(hyprauto PROPERTIES PREFIX "" CXX_STANDARD 23 CXX_STANDARD_REQUIRED YES)
 target_compile_definitions(hyprauto PRIVATE HYPRAUTO_VERSION="${PROJECT_VERSION}")
 target_compile_options(hyprauto PRIVATE -Wall -Wextra -Wno-unused-parameter -Wno-missing-field-initializers)

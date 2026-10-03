@@ -171,7 +171,11 @@ def run(binary, build_dir, plugin):
             )
             ipc = wait_for(lambda: next(iter(runtime.glob("hypr/*/.socket.sock")), None), "headless IPC")
 
-            def raw_command(request):
+            sys.path.insert(0, str(TESTS.parent))
+            from hyprauto_ctrl.transport import SessionSocket
+            session_connection = None
+
+            def ipc_command(request):
                 with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as connection:
                     connection.settimeout(5)
                     connection.connect(str(ipc))
@@ -180,6 +184,28 @@ def run(binary, build_dir, plugin):
                     while chunk := connection.recv(65536):
                         chunks.append(chunk)
                 return b"".join(chunks)
+
+            def raw_command(request):
+                nonlocal session_connection
+                if request.startswith("/hyprauto "):
+                    operation = request[len("/hyprauto "):]
+                    if session_connection is None:
+                        session_connection = SessionSocket(ipc.parent / ".hyprauto.sock")
+                    if operation.startswith("begin "):
+                        operation = "set-target " + operation[len("begin "):]
+                    try:
+                        response = session_connection.request(operation)
+                    except RuntimeError as exc:
+                        response = ("error: " + str(exc)).encode()
+                    if operation == "end":
+                        session_connection.close()
+                        session_connection = None
+                    return response
+                response = ipc_command(request)
+                if request.startswith("/plugin unload ") and session_connection is not None:
+                    session_connection.close()
+                    session_connection = None
+                return response
 
             def command(request):
                 return raw_command(request).decode().strip()
@@ -526,13 +552,15 @@ finally:
             auto("block-input on")
             auto("key 30 down")
             auto("button 272 down")
+            unmap_session_id = status()["session_id"]
             unmap_start = len(target.sync())
             target.request("unmap", "unmapped")
             wait_for(lambda: not status()["active"], "unmap cancels session")
             assert not status()["block_input"]
+            assert status()["session_id"] == unmap_session_id
             assert any(e.startswith("key 30 0 ") for e in target.events[unmap_start:]), target.events[unmap_start:]
             assert "button 272 0" in target.events[unmap_start:]
-            check("target unmap cancels session and releases held input")
+            check("target unmap clears its binding and releases held input")
 
             target.close()
             clients.remove(target)
@@ -588,6 +616,169 @@ finally:
             assert "keyboard-leave" not in foreground
             auto("end")
             check("unload/reload restores host routing and permits coexisting foreground sessions")
+
+            service = json.loads(ipc_command("/hyprauto status"))
+            assert service["protocol"] == 1 and service["socket"] == str(ipc.parent / ".hyprauto.sock"), service
+            assert (Path(service["socket"]).stat().st_mode & 0o777) == 0o600
+            focus("host-b")
+            first = SessionSocket(Path(service["socket"]))
+            second = SessionSocket(Path(service["socket"]))
+            try:
+                assert first.session_id != second.session_id
+                assert first.request("set-target class:target") == b"ok"
+                assert second.request("set-target class:host-a") == b"ok"
+                first.request("key 42 down")
+                first.request("key 30 down")
+                first.request("button 272 down")
+                second.request("key 48 down")
+                second.request("button 273 down")
+                first.request("move 40 50")
+                second.request("move 60 70")
+                first.request("block-input on")
+                first_state = json.loads(first.request("status"))
+                second_state = json.loads(second.request("status"))
+                assert first_state["keys"] == [30, 42] and first_state["buttons"] == [272]
+                assert second_state["keys"] == [48] and second_state["buttons"] == [273]
+                assert first_state["position"] == [40, 50] and second_state["position"] == [60, 70]
+                assert first_state["block_input"] and not second_state["block_input"]
+                for selector in ("class:target", "class:missing"):
+                    try:
+                        second.request("set-target " + selector)
+                    except RuntimeError:
+                        pass
+                    else:
+                        raise AssertionError("conflicting or absent target accepted")
+                    assert json.loads(second.request("status")) == second_state
+                assert first.request("set-target class:target") == b"ok"
+                assert json.loads(first.request("status")) == first_state
+                sync_all()
+                assert "key 30 1 65" in target.events and any(e.startswith("key 48 1 ") for e in host_a.events)
+                json.loads(first.request("screenshot"))
+                second_capture = json.loads(second.request("screenshot"))["id"]
+                cleanup_start = len(target.sync())
+                first.close()
+                wait_for(lambda: first.session_id not in [s["session_id"] for s in json.loads(ipc_command("/hyprauto sessions"))], "connection cleanup")
+                cleanup = target.sync()[cleanup_start:]
+                assert any(e.startswith("key 30 0 ") for e in cleanup) and "button 272 0" in cleanup, cleanup
+                assert json.loads(second.request("status"))["keys"] == [48]
+                def second_ready():
+                    result = json.loads(second.request(f"screenshot-status {second_capture}"))
+                    assert result["state"] != "failed", result
+                    return result if result["state"] == "ready" else None
+                assert wait_for(second_ready, "independent capture")["size"] == 320 * 240 * 4
+                assert second.request(f"screenshot-read {second_capture} 0 4") == b"data:" + bytes((16, 32, 64, 128))
+                second.request(f"screenshot-release {second_capture}")
+                second.request("key 48 up")
+                second.request("button 273 up")
+                assert second.request("set-target class:target") == b"ok"
+                assert json.loads(second.request("status"))["target"] == "target"
+                second.request("key 30 down")
+                cleanup_start = len(target.sync())
+                assert ipc_command(f"/hyprauto end {second.session_id}") == b"ok"
+                wait_for(lambda: second._stopped.is_set(), "forced session disconnect")
+                assert any(e.startswith("key 30 0 ") for e in target.sync()[cleanup_start:])
+            finally:
+                first.close()
+                second.close()
+            check("multiple sessions isolate input, target ownership, capture and disconnect cleanup; management can revoke a session")
+
+            crash_start = len(target.sync())
+            crash = subprocess.run([sys.executable, "-c", """
+from hyprauto_ctrl import HyprAutoController
+import os
+controller = HyprAutoController()
+job = controller.post_connection('class:target').wait(10)
+assert job.succeeded, job.error
+job = controller.post_key_down(30).wait(10)
+assert job.succeeded, job.error
+os._exit(0)
+"""], env=env, cwd=TESTS.parent, capture_output=True, text=True, timeout=20)
+            assert crash.returncode == 0, crash.stderr
+            wait_for(lambda: any(e.startswith("key 30 0 ") for e in target.sync()[crash_start:]), "crashed owner cleanup")
+            check("Python process crash releases input without calling close or end")
+
+            stale = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+            stale.settimeout(35)
+            stale.connect(service["socket"])
+            def stale_exact(size):
+                data = bytearray()
+                while len(data) < size:
+                    chunk = stale.recv(size - len(data))
+                    assert chunk, "unexpected stale connection EOF"
+                    data.extend(chunk)
+                return bytes(data)
+            def stale_frame():
+                length = struct.unpack("!I", stale_exact(4))[0]
+                frame = stale_exact(length)
+                assert frame[:1] == b"J", frame
+                return json.loads(frame[1:])
+            stale_id = stale_frame()["session_id"]
+            def stale_request(request_id, operation):
+                payload = b"J" + json.dumps({"id": request_id, "command": operation}).encode()
+                packet = struct.pack("!I", len(payload)) + payload
+                stale.sendall(packet[:4])
+                ipc_command("/hyprauto status")
+                stale.sendall(packet[4:])
+                response = stale_frame()
+                assert response == {"id": request_id, "result": "ok"}, response
+            live = SessionSocket(Path(service["socket"]))
+            try:
+                stale_request(1, "set-target class:target")
+                stale_request(2, "key 30 down")
+                stale_request(3, "button 272 down")
+                live.request("set-target class:host-a")
+                live.request("key 48 down")
+                cleanup_start = len(target.sync())
+                wait_for(lambda: stale_id not in [s["session_id"] for s in json.loads(ipc_command("/hyprauto sessions"))], "lease expiry", timeout=35)
+                assert stale.recv(1) == b""
+                cleanup = target.sync()[cleanup_start:]
+                assert any(e.startswith("key 30 0 ") for e in cleanup) and "button 272 0" in cleanup, cleanup
+                assert json.loads(live.request("status"))["keys"] == [48]
+                assert live.request("set-target class:target") == b"ok"
+                assert json.loads(live.request("status"))["keys"] == []
+            finally:
+                stale.close()
+                live.close()
+            check("fragmented frames work; stale leases release input while idle Python sessions remain alive through heartbeats")
+
+            for malformed in (struct.pack("!I", 16385), b"\x00\x00\x00\x02BX", b'\x00\x00\x00\x03J{}'):
+                stale = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+                stale.settimeout(5)
+                stale.connect(service["socket"])
+                malformed_id = stale_frame()["session_id"]
+                try:
+                    stale_request(1, "set-target class:target")
+                    stale_request(2, "key 30 down")
+                    cleanup_start = len(target.sync())
+                    stale.sendall(malformed)
+                    assert stale.recv(1) == b""
+                    assert malformed_id not in [s["session_id"] for s in json.loads(ipc_command("/hyprauto sessions"))]
+                    assert any(e.startswith("key 30 0 ") for e in target.sync()[cleanup_start:])
+                finally:
+                    stale.close()
+            stale = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+            stale.settimeout(5)
+            stale.connect(service["socket"])
+            try:
+                stale_frame()
+                packets = []
+                for request_id, operation in ((1, "heartbeat"), (2, "status")):
+                    payload = b"J" + json.dumps({"id": request_id, "command": operation}).encode()
+                    packets.append(struct.pack("!I", len(payload)) + payload)
+                stale.sendall(b"".join(packets))
+                assert stale_frame() == {"id": 1, "result": "ok"}
+                response = stale_frame()
+                assert response["id"] == 2 and not json.loads(response["result"])["active"]
+                stale_request(3, " end ")
+                assert stale.recv(1) == b""
+            finally:
+                stale.close()
+            check("malformed frames disconnect and release input; pipelined commands retain request IDs and end acknowledges before disconnect")
+            if session_connection is not None:
+                session_connection.close()
+                session_connection = None
+            ok(f"/plugin unload {plugin}")
+            assert not Path(service["socket"]).exists()
             print(f"All checks passed. Logs: {logs}", flush=True)
         finally:
             for client in clients:

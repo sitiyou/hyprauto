@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import json
 import os
-import socket
 import threading
 import time
 from contextlib import suppress
@@ -10,6 +9,8 @@ from pathlib import Path
 from typing import Any
 
 import numpy as np
+
+from .transport import SessionSocket
 
 
 class Job:
@@ -73,26 +74,13 @@ class HyprAutoController:
         self.instance = instance
         self._lock = threading.Lock()
         self._connected = False
-        self._socket_path: Path | None = None
+        self._connection: SessionSocket | None = None
         self._cached_image: np.ndarray | None = None
 
     def _request(self, *args: str) -> bytes:
-        if self._socket_path is None:
+        if self._connection is None:
             raise RuntimeError("not connected; call post_connection() first")
-        request = ("/hyprauto " + " ".join(args)).encode()
-        try:
-            with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as connection:
-                connection.settimeout(30)
-                connection.connect(str(self._socket_path))
-                connection.sendall(request)
-                response = bytearray()
-                while chunk := connection.recv(65536):
-                    response.extend(chunk)
-        except OSError as exc:
-            raise RuntimeError(f"Hyprland IPC request failed: {exc}") from exc
-        if response.startswith(b"error:"):
-            raise RuntimeError(response.decode(errors="replace").strip())
-        return bytes(response)
+        return self._connection.request(" ".join(args))
 
     def _command(self, *args: str) -> str:
         return self._request(*args).decode(errors="replace").strip()
@@ -113,24 +101,20 @@ class HyprAutoController:
 
     def post_connection(self, target: str | None = None) -> Job:
         def connect() -> str:
-            if self._connected:
-                self._command("end")
-                self._connected = False
+            if self._connection is not None:
+                self._connection.close()
+                self._connection = None
+            self._connected = False
+            self.target = None
             signature = self.instance or os.environ.get("HYPRLAND_INSTANCE_SIGNATURE")
             runtime_dir = os.environ.get("XDG_RUNTIME_DIR")
             if not signature or not runtime_dir:
                 raise RuntimeError("Hyprland instance and XDG_RUNTIME_DIR are required")
-            path = Path(runtime_dir) / "hypr" / signature / ".socket.sock"
-            try:
-                with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as connection:
-                    connection.settimeout(5)
-                    connection.connect(str(path))
-            except OSError as exc:
-                raise RuntimeError(f"cannot connect to Hyprland IPC socket {path}: {exc}") from exc
+            path = Path(runtime_dir) / "hypr" / signature / ".hyprauto.sock"
+            self._connection = SessionSocket(path)
             self.instance = signature
-            self._socket_path = path
             if target:
-                output = self._command("begin", target)
+                output = self._command("set-target", target)
                 self.target = target
                 self._connected = True
                 return output
@@ -144,12 +128,7 @@ class HyprAutoController:
             return Job(error="target selector must not be empty")
 
         def select() -> str:
-            if self._socket_path is None:
-                raise RuntimeError("not connected; call post_connection() first")
-            if self._connected:
-                self._command("end")
-                self._connected = False
-            output = self._command("begin", selector)
+            output = self._command("set-target", selector)
             self.target = selector
             self._connected = True
             return output
@@ -264,9 +243,25 @@ class HyprAutoController:
     def post_status(self) -> JobWithResult:
         return self._submit(lambda: json.loads(self._command("status")), result=True)
 
+    @property
+    def session_id(self) -> int | None:
+        return self._connection.session_id if self._connection is not None else None
+
+    def __enter__(self) -> HyprAutoController:
+        return self
+
+    def __exit__(self, exc_type, exc_value, traceback) -> None:
+        self.close()
+
     def close(self) -> None:
         with self._lock:
-            if self._connected:
-                self._command("end")
-                self._connected = False
-            self._socket_path = None
+            if self._connection is not None:
+                try:
+                    self._command("end")
+                except RuntimeError:
+                    pass
+                finally:
+                    self._connection.close()
+                    self._connection = None
+            self._connected = False
+            self.target = None

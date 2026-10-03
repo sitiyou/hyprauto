@@ -1,5 +1,9 @@
 #include "HyprlandCompat.hpp"
 #include "Capture.hpp"
+#include "Socket.hpp"
+#include <src/Compositor.hpp>
+#include <map>
+#include <algorithm>
 #include <src/protocols/core/Seat.hpp>
 #include <src/protocols/core/Compositor.hpp>
 #include <src/managers/SeatManager.hpp>
@@ -35,19 +39,29 @@ static CHyprSignalListener           hostCursorListener;
 static uint64_t                      hostCursorUpdates = 0;
 
 struct Session {
-    wl_client*                           client = nullptr;
-    PHLWINDOWREF                         window;
-    WP<CWLSurfaceResource>               surface;
-    std::vector<WP<CWLKeyboardResource>> keyboards;
-    std::vector<WP<CWLPointerResource>>  pointers;
-    std::set<uint32_t>                   keys, buttons;
-    bool                                 blockInput = false;
-    Vector2D                             position   = {1, 1};
-    xkb_state*                           xkb        = nullptr;
-    CHyprSignalListener                  surfaceDestroy;
+    uint64_t                                id = 0;
+    std::unique_ptr<Hyprauto::Capture::Job> capture;
+    wl_client*                              client = nullptr;
+    PHLWINDOWREF                            window;
+    WP<CWLSurfaceResource>                  surface;
+    std::vector<WP<CWLKeyboardResource>>    keyboards;
+    std::vector<WP<CWLPointerResource>>     pointers;
+    std::set<uint32_t>                      keys, buttons;
+    bool                                    blockInput = false;
+    Vector2D                                position   = {1, 1};
+    xkb_state*                              xkb        = nullptr;
+    CHyprSignalListener                     surfaceDestroy;
 };
 
-static Session  session;
+static std::map<uint64_t, std::unique_ptr<Session>> sessions;
+static std::unique_ptr<Hyprauto::Socket>            server;
+
+static Session*                                     clientSession(wl_client* client) {
+    for (const auto& [id, session] : sessions)
+        if (session->client == client)
+            return session.get();
+    return nullptr;
+}
 
 static uint32_t now() {
     return static_cast<uint32_t>(Time::millis(Time::steadyNow()));
@@ -72,10 +86,12 @@ struct Gate {
     static constexpr bool        frameEvent = ID == 8;
 
     static void                  call(Resource* self, Args... args) {
-        if (!automationDispatch && session.client && self->m_owner && self->m_owner->client() == session.client) {
-            const auto& hostFocus = std::is_same_v<Resource, CWLKeyboardResource> ? g_pSeatManager->m_state.keyboardFocus : g_pSeatManager->m_state.pointerFocus;
-            if (focusEvent || session.blockInput || (!frameEvent && (!hostFocus || hostFocus->client() != session.client)))
-                return;
+        if (!automationDispatch && self->m_owner) {
+            if (auto session = clientSession(self->m_owner->client())) {
+                const auto& hostFocus = std::is_same_v<Resource, CWLKeyboardResource> ? g_pSeatManager->m_state.keyboardFocus : g_pSeatManager->m_state.pointerFocus;
+                if (focusEvent || session->blockInput || (!frameEvent && (!hostFocus || hostFocus->client() != session->client)))
+                    return;
+            }
         }
         reinterpret_cast<void (*)(Resource*, Args...)>(hook->m_original)(self, args...);
     }
@@ -85,7 +101,7 @@ struct Gate {
     }
 };
 
-static void sendModifiers() {
+static void sendModifiers(Session& session) {
     for (const auto& weak : session.keyboards) {
         if (auto keyboard = weak.lock())
             keyboard->sendMods(xkb_state_serialize_mods(session.xkb, XKB_STATE_MODS_DEPRESSED), xkb_state_serialize_mods(session.xkb, XKB_STATE_MODS_LATCHED),
@@ -111,8 +127,8 @@ static std::vector<SP<CWLSeatResource>> clientSeats(wl_client* client) {
 template <typename Callback>
 static void forEachHostKeyboard(Callback callback) {
     wl_client* client = nullptr;
-    wl_client_for_each(client, wl_display_get_client_list(wl_client_get_display(session.client))) {
-        if (client == session.client)
+    wl_client_for_each(client, wl_display_get_client_list(g_pCompositor->m_wlDisplay)) {
+        if (clientSession(client))
             continue;
         for (const auto& seat : clientSeats(client))
             for (const auto& weak : seat->m_keyboards)
@@ -122,7 +138,7 @@ static void forEachHostKeyboard(Callback callback) {
 }
 
 static void updateHostKeymaps(CWLSeatProtocol* self) {
-    if (!session.client) {
+    if (std::ranges::none_of(sessions, [](const auto& entry) { return entry.second->client; })) {
         reinterpret_cast<void (*)(CWLSeatProtocol*)>(keymapHook->m_original)(self);
         return;
     }
@@ -130,15 +146,15 @@ static void updateHostKeymaps(CWLSeatProtocol* self) {
 }
 
 static void updateHostRepeatInfo(CWLSeatProtocol* self, uint32_t rate, uint32_t delay) {
-    if (!session.client) {
+    if (std::ranges::none_of(sessions, [](const auto& entry) { return entry.second->client; })) {
         reinterpret_cast<void (*)(CWLSeatProtocol*, uint32_t, uint32_t)>(repeatHook->m_original)(self, rate, delay);
         return;
     }
     forEachHostKeyboard([&](const auto& keyboard) { keyboard->repeatInfo(rate, delay); });
 }
 
-static void endSession(bool restoreHostFocus = true) {
-    Hyprauto::Capture::cancel();
+static void clearTarget(Session& session, bool restoreHostFocus = true) {
+    session.capture->cancel();
     if (!session.client)
         return;
     const bool previousDispatch = automationDispatch;
@@ -188,17 +204,24 @@ static void endSession(bool restoreHostFocus = true) {
         }
     }
     xkb_state_unref(session.xkb);
-    session = {};
+    auto       capture = std::move(session.capture);
+    const auto id      = session.id;
+    session            = {};
+    session.id         = id;
+    session.capture    = std::move(capture);
 }
 
-static std::string beginSession(const std::string& selector) {
-    if (session.client)
-        return "error: session already active";
+static std::string setTarget(Session& current, const std::string& selector) {
     auto window = Desktop::viewState()->query().mappedOnly().selector(selector).runWindow();
     if (!window || Hyprauto::Compat::isX11(window))
         return "error: expected a mapped native Wayland window";
     auto surface = window->wlSurface()->resource();
     auto client  = surface->client();
+    if (window == current.window.lock())
+        return "ok";
+    if (auto owner = clientSession(client); owner && owner != &current)
+        return "error: target client is already owned by another session";
+    Session session;
     if (!g_pSeatManager->m_keyboard || !g_pSeatManager->m_mouse)
         return "error: keyboard and pointer capabilities required";
     for (const auto& seat : clientSeats(client)) {
@@ -209,30 +232,33 @@ static std::string beginSession(const std::string& selector) {
             if (pointer)
                 session.pointers.push_back(pointer);
     }
-    if (session.keyboards.empty() || session.pointers.empty()) {
-        session = {};
+    if (session.keyboards.empty() || session.pointers.empty())
         return "error: target must bind keyboard and pointer before beginning";
-    }
     session.xkb = xkb_state_new(g_pSeatManager->m_keyboard->m_xkbKeymap);
-    if (!session.xkb) {
-        session = {};
+    if (!session.xkb)
         return "error: cannot create independent XKB state";
-    }
-    session.client         = client;
-    session.window         = window;
-    session.surface        = surface;
-    session.surfaceDestroy = surface->m_events.destroy.listen([] { endSession(false); });
+    session.client  = client;
+    session.window  = window;
+    session.surface = surface;
+    clearTarget(current);
+    session.id             = current.id;
+    session.capture        = std::move(current.capture);
+    current                = std::move(session);
+    current.surfaceDestroy = surface->m_events.destroy.listen([id = current.id] {
+        if (auto it = sessions.find(id); it != sessions.end())
+            clearTarget(*it->second, false);
+    });
     wl_array keys{};
-    for (const auto& weak : session.keyboards) {
+    for (const auto& weak : current.keyboards) {
         if (auto keyboard = weak.lock()) {
             keyboard->sendKeymap(g_pSeatManager->m_keyboard.lock());
             keyboard->sendEnter(surface, &keys);
         }
     }
-    sendModifiers();
-    for (const auto& weak : session.pointers) {
+    sendModifiers(current);
+    for (const auto& weak : current.pointers) {
         if (auto pointer = weak.lock()) {
-            pointer->sendEnter(surface, session.position);
+            pointer->sendEnter(surface, current.position);
             pointer->sendFrame();
         }
     }
@@ -243,11 +269,13 @@ static uint32_t surfaceID(const WP<CWLSurfaceResource>& surface) {
     return surface ? wl_resource_get_id(surface->getResource()->resource()) : 0;
 }
 
-static std::string status() {
+static std::string status(const Session& session) {
     auto       window   = Desktop::focusState()->window();
     auto       cursor   = g_pInputManager->getMouseCoordsInternal();
     const auto keyboard = g_pSeatManager->m_keyboard.lock();
     return nlohmann::json{
+        {"session_id", session.id},
+        {"target", session.window ? Hyprauto::Compat::appID(session.window.lock()) : ""},
         {"active", session.client != nullptr},
         {"block_input", session.blockInput},
         {"keys", session.keys},
@@ -267,25 +295,31 @@ static std::string status() {
         .dump();
 }
 
-static std::string dispatch(const std::string& request) {
+static std::string dispatchSession(uint64_t id, const std::string& request) {
+    auto&              session = *sessions.at(id);
     std::istringstream input(request);
-    std::string        prefix, operation;
-    input >> prefix >> operation;
-    if (prefix != "hyprauto")
-        return "error: unknown command";
-    if (operation == "status")
-        return status();
+    std::string        operation;
+    input >> operation;
+    if (operation == "status" || operation == "heartbeat" || operation == "end") {
+        std::string extra;
+        if (input >> extra)
+            return "error: command accepts no arguments";
+        if (operation == "status")
+            return status(session);
+        if (operation == "heartbeat")
+            return "ok";
+    }
     automationDispatch = true;
     CScopeGuard restore([] { automationDispatch = false; });
     if (operation == "end") {
-        endSession();
+        clearTarget(session);
         return "ok";
     }
-    if (operation == "begin") {
+    if (operation == "set-target") {
         std::string selector, extra;
         if (!(input >> selector) || input >> extra)
-            return "error: begin requires one window selector";
-        return beginSession(selector);
+            return "error: set-target requires one window selector";
+        return setTarget(session, selector);
     }
     if (!session.client || !session.surface)
         return "error: no active session";
@@ -295,7 +329,7 @@ static std::string dispatch(const std::string& request) {
         if (!input.eof() && (!(input >> std::quoted(path)) || path.empty() || input >> extra))
             return "error: screenshot accepts one optional PNG path";
         auto window = session.window.lock();
-        return window ? Hyprauto::Capture::start(window, path) : "error: session target is unavailable";
+        return window ? session.capture->start(window, path) : "error: session target is unavailable";
     }
     if (operation == "screenshot-status" || operation == "screenshot-release" || operation == "screenshot-read") {
         uint64_t    id;
@@ -306,11 +340,11 @@ static std::string dispatch(const std::string& request) {
             size_t offset, length;
             if (!(input >> offset >> length) || input >> extra)
                 return "error: screenshot-read requires ID, offset and length";
-            return Hyprauto::Capture::read(id, offset, length);
+            return session.capture->read(id, offset, length);
         }
         if (input >> extra)
             return "error: screenshot command accepts one ID";
-        return operation == "screenshot-status" ? Hyprauto::Capture::status(id) : Hyprauto::Capture::release(id);
+        return operation == "screenshot-status" ? session.capture->status(id) : session.capture->release(id);
     }
     if (operation == "block-input") {
         std::string mode, extra;
@@ -334,12 +368,12 @@ static std::string dispatch(const std::string& request) {
         else
             pressed.erase(code);
         if (operation == "key") {
-            sendModifiers();
+            sendModifiers(session);
             for (const auto& weak : session.keyboards)
                 if (auto keyboard = weak.lock())
                     keyboard->sendKey(now(), code, down ? WL_KEYBOARD_KEY_STATE_PRESSED : WL_KEYBOARD_KEY_STATE_RELEASED);
             xkb_state_update_key(session.xkb, code + 8, down ? XKB_KEY_DOWN : XKB_KEY_UP);
-            sendModifiers();
+            sendModifiers(session);
         } else {
             for (const auto& weak : session.pointers) {
                 if (auto pointer = weak.lock()) {
@@ -366,7 +400,33 @@ static std::string dispatch(const std::string& request) {
         }
         return "ok";
     }
-    return "error: use begin, key, move, button, screenshot, screenshot-status, screenshot-read, screenshot-release, block-input, end or status";
+    return "error: unknown session command";
+}
+
+static std::string dispatchManagement(const std::string& request) {
+    std::istringstream input(request);
+    std::string        prefix, operation, extra;
+    input >> prefix >> operation;
+    if (prefix != "hyprauto" || !server)
+        return "error: hyprauto service is unavailable";
+    if (operation == "end") {
+        uint64_t id;
+        if (!(input >> id) || input >> extra || !sessions.contains(id))
+            return "error: expected an active session ID";
+        server->disconnect(id);
+        return "ok";
+    }
+    if (input >> extra)
+        return "error: command accepts no arguments";
+    if (operation == "status")
+        return nlohmann::json{{"socket", server->path()}, {"protocol", 1}, {"sessions", sessions.size()}, {"lease_ms", 30000}}.dump();
+    if (operation == "sessions") {
+        auto result = nlohmann::json::array();
+        for (const auto& [id, session] : sessions)
+            result.push_back(nlohmann::json::parse(status(*session)));
+        return result.dump();
+    }
+    return "error: use status, sessions or end <session-id>";
 }
 
 APICALL EXPORT std::string PLUGIN_API_VERSION() {
@@ -394,20 +454,35 @@ APICALL EXPORT PLUGIN_DESCRIPTION_INFO PLUGIN_INIT(HANDLE pluginHandle) {
     Gate<14, CWLPointerResource, wl_pointer_axis, wl_pointer_axis_relative_direction>::install("CWLPointerResource::sendAxisRelativeDirection");
     keymapHook = installHook("CWLSeatProtocol::updateKeymap", reinterpret_cast<void*>(&updateHostKeymaps));
     repeatHook = installHook("CWLSeatProtocol::updateRepeatInfo", reinterpret_cast<void*>(&updateHostRepeatInfo));
-    command    = Hyprauto::Compat::registerCommand(handle, "hyprauto", dispatch);
+    command    = Hyprauto::Compat::registerCommand(handle, "hyprauto", dispatchManagement);
     if (!command)
         throw std::runtime_error("Cannot register hyprauto command");
     hostCursorListener = g_pSeatManager->m_events.setCursor.listen([](const auto&) { ++hostCursorUpdates; });
     windowClose        = Event::bus()->m_events.window.close.listen([](PHLWINDOW window) {
-        if (window == session.window.lock())
-            endSession(false);
+        for (const auto& [id, session] : sessions)
+            if (window == session->window.lock())
+                clearTarget(*session, false);
     });
+    server             = std::make_unique<Hyprauto::Socket>(
+        wl_display_get_event_loop(g_pCompositor->m_wlDisplay), g_pCompositor->m_instancePath + "/.hyprauto.sock",
+        [](uint64_t id) {
+            auto session     = std::make_unique<Session>();
+            session->id      = id;
+            session->capture = std::make_unique<Hyprauto::Capture::Job>();
+            sessions.emplace(id, std::move(session));
+        },
+        [](uint64_t id) {
+            if (auto it = sessions.find(id); it != sessions.end()) {
+                clearTarget(*it->second);
+                sessions.erase(it);
+            }
+        },
+        dispatchSession);
     return {"hyprauto", "Independent background Wayland input sessions", "hyprauto contributors", HYPRAUTO_VERSION};
 }
 
 APICALL EXPORT void PLUGIN_EXIT() {
-    endSession();
-    Hyprauto::Capture::shutdown();
+    server.reset();
     windowClose.reset();
     hostCursorListener.reset();
     HyprlandAPI::unregisterHyprCtlCommand(handle, command);
