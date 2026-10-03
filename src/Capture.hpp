@@ -5,6 +5,8 @@
 #include <string>
 
 namespace Hyprauto::Capture {
+    void shutdown();
+
     class Job {
       public:
         Job();

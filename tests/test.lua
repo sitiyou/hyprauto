@@ -6,8 +6,10 @@ hl.config({
     input = { follow_mouse = 1 },
     misc = { disable_hyprland_logo = true, disable_splash_rendering = true },
 })
-hl.window_rule({ name = "test-windows", match = { class = "^(target|target-other|host-a|host-b)$" }, float = true, size = "320 240" })
+hl.window_rule({ name = "test-windows", match = { class = "^(target|target-other|host-a|host-b|capture-[ab])$" }, float = true, size = "320 240" })
 hl.window_rule({ name = "target-position", match = { class = "^target$" }, move = "30 30", opacity = "0.35 0.35" })
 hl.window_rule({ name = "host-a-position", match = { class = "^host-a$" }, move = "430 30" })
 hl.window_rule({ name = "host-b-position", match = { class = "^host-b$" }, move = "830 30" })
 hl.window_rule({ name = "target-other-position", match = { class = "^target-other$" }, move = "430 350" })
+hl.window_rule({ name = "capture-a-position", match = { class = "^capture-a$" }, move = "30 350" })
+hl.window_rule({ name = "capture-b-position", match = { class = "^capture-b$" }, move = "830 350" })

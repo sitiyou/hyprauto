@@ -1,5 +1,9 @@
 #include "Capture.hpp"
 #include <src/render/Renderer.hpp>
+#include <src/Compositor.hpp>
+#include <src/debug/log/Logger.hpp>
+#include <src/render/SyncFDManager.hpp>
+#include <src/helpers/sync/SyncReleaser.hpp>
 #include <src/render/pass/SurfacePassElement.hpp>
 #include <src/protocols/core/Compositor.hpp>
 #include <src/protocols/XDGShell.hpp>
@@ -8,6 +12,7 @@
 #include <src/helpers/cm/ColorManagement.hpp>
 #include <hyprutils/utils/ScopeGuard.hpp>
 #include <nlohmann/json.hpp>
+#include <algorithm>
 #include <atomic>
 #include <chrono>
 #include <cstring>
@@ -18,6 +23,94 @@ using nlohmann::json;
 using Render::GL::g_pHyprOpenGL;
 
 namespace Hyprauto::Capture {
+    struct BufferUse {
+        std::vector<CHLBufferReference>       buffers;
+        UP<Render::ISyncFDManager>            sync;
+        GLsync                                fence  = nullptr;
+        wl_event_source*                      source = nullptr;
+        std::chrono::steady_clock::time_point started;
+
+        ~BufferUse() {
+            finish(!buffers.empty());
+        }
+
+        void finish(bool wait) {
+            if (source) {
+                wl_event_source_remove(source);
+                source = nullptr;
+            }
+            if (wait || fence || sync)
+                g_pHyprOpenGL->makeEGLCurrent();
+            if (wait)
+                glFinish();
+            if (fence) {
+                glDeleteSync(fence);
+                fence = nullptr;
+            }
+            buffers.clear();
+            sync.reset();
+        }
+
+        static int readable(int, uint32_t mask, void* data) {
+            auto&      use    = *static_cast<BufferUse*>(data);
+            const bool failed = mask & (WL_EVENT_ERROR | WL_EVENT_HANGUP);
+            if (failed)
+                Log::logger->log(Log::ERR, "[hyprauto] capture source fence failed; synchronizing cleanup");
+            use.finish(failed);
+            return 0;
+        }
+
+        static int poll(void* data) {
+            auto& use = *static_cast<BufferUse*>(data);
+            g_pHyprOpenGL->makeEGLCurrent();
+            const auto status = glClientWaitSync(use.fence, 0, 0);
+            if (status == GL_ALREADY_SIGNALED || status == GL_CONDITION_SATISFIED) {
+                use.finish(false);
+                return 0;
+            }
+            if (status == GL_TIMEOUT_EXPIRED && std::chrono::steady_clock::now() - use.started < std::chrono::seconds(10) && wl_event_source_timer_update(use.source, 1) == 0)
+                return 0;
+            Log::logger->log(Log::ERR, "[hyprauto] capture source fence failed or timed out; synchronizing cleanup");
+            use.finish(true);
+            return 0;
+        }
+
+        bool arm() {
+            if (buffers.empty())
+                return true;
+            started = std::chrono::steady_clock::now();
+            if (g_pHyprOpenGL->m_exts.EGL_ANDROID_native_fence_sync_ext) {
+                sync = g_pHyprRenderer->createSyncFDManager();
+                if (sync && sync->isValid()) {
+                    for (const auto& buffer : buffers)
+                        for (const auto& releaser : buffer->m_syncReleasers)
+                            releaser->addSyncFileFd(sync->fd());
+                    source = wl_event_loop_add_fd(g_pCompositor->m_wlEventLoop, sync->fd().get(), WL_EVENT_READABLE, readable, this);
+                    if (source)
+                        return true;
+                }
+            } else {
+                fence = glFenceSync(GL_SYNC_GPU_COMMANDS_COMPLETE, 0);
+                glFlush();
+                const auto error = glGetError();
+                if (fence && error == GL_NO_ERROR) {
+                    source = wl_event_loop_add_timer(g_pCompositor->m_wlEventLoop, poll, this);
+                    if (source && wl_event_source_timer_update(source, 1) == 0)
+                        return true;
+                }
+            }
+            Log::logger->log(Log::ERR, "[hyprauto] cannot track capture source buffers; synchronizing cleanup");
+            finish(true);
+            return false;
+        }
+    };
+
+    static std::vector<UP<BufferUse>> bufferUses;
+
+    void                              shutdown() {
+        bufferUses.clear();
+    }
+
     struct Job::State {
         uint64_t                              id     = 0;
         bool                                  active = false;
@@ -85,6 +178,18 @@ namespace Hyprauto::Capture {
             if (!framebuffer->isAllocated())
                 return "error: cannot allocate capture framebuffer";
             framebuffer->setImageDescription(NColorManagement::DEFAULT_SRGB_IMAGE_DESCRIPTION);
+            std::erase_if(bufferUses, [](const auto& use) { return use->buffers.empty(); });
+            bufferUses.emplace_back(makeUnique<BufferUse>());
+            auto&                           use = *bufferUses.back();
+            std::vector<CHLBufferReference> previousBuffers;
+            previousBuffers.swap(g_pHyprRenderer->m_usedAsyncBuffers);
+            CScopeGuard restoreBuffers([&] {
+                if (!g_pHyprRenderer->m_usedAsyncBuffers.empty())
+                    use.buffers.swap(g_pHyprRenderer->m_usedAsyncBuffers);
+                previousBuffers.swap(g_pHyprRenderer->m_usedAsyncBuffers);
+                if (!use.buffers.empty() && !use.source)
+                    use.finish(true);
+            });
             CRegion damage{0, 0, size.x, size.y};
             if (!g_pHyprRenderer->beginFullFakeRender(monitor, damage, framebuffer))
                 return "error: cannot begin window capture";
@@ -142,6 +247,9 @@ namespace Hyprauto::Capture {
             g_pHyprRenderer->m_renderData.blockScreenShader = true;
             g_pHyprRenderer->endRender();
             g_pHyprRenderer->m_renderData.pMonitor.reset();
+            use.buffers.swap(g_pHyprRenderer->m_usedAsyncBuffers);
+            if (!use.arm())
+                return "error: cannot track screenshot source buffers";
 
             GLint previousBuffer, previousFramebuffer, alignment, rowLength, skipRows, skipPixels;
             glGetIntegerv(GL_PIXEL_PACK_BUFFER_BINDING, &previousBuffer);
@@ -170,7 +278,8 @@ namespace Hyprauto::Capture {
             glReadPixels(0, 0, width, height, GL_RGBA, GL_UNSIGNED_BYTE, nullptr);
             fence = glFenceSync(GL_SYNC_GPU_COMMANDS_COMPLETE, 0);
             glFlush();
-            if (!fence || glGetError() != GL_NO_ERROR) {
+            const auto submissionError = glGetError();
+            if (!fence || submissionError != GL_NO_ERROR) {
                 cancel();
                 return "error: cannot submit asynchronous pixel readback";
             }

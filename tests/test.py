@@ -10,6 +10,7 @@ import tempfile
 import threading
 import time
 import zlib
+from contextlib import closing
 from pathlib import Path
 
 TESTS = Path(__file__).resolve().parent
@@ -163,6 +164,7 @@ def run(binary, build_dir, plugin):
             nodes = sorted(Path("/dev/dri").glob("renderD*"))
             assert nodes, "A DRM render node is required"
             node = nodes[0]
+            env["AUTO_INPUT_RENDER_NODE"] = str(node)
             sandbox.extend(("--dev-bind", str(node), str(node)))
             compositor = subprocess.Popen(
                 sandbox + ["env", f"LD_PRELOAD={build_dir / 'headless.so'}",
@@ -1019,6 +1021,196 @@ os._exit(0)
             if session_connection is not None:
                 session_connection.close()
                 session_connection = None
+            dma_env = env | {"HYPRAUTO_TEST_DMABUF": "1"}
+            dma_a = Client("capture-a", dma_env, logs)
+            clients.append(dma_a)
+            dma_b = Client("capture-b", dma_env, logs)
+            clients.append(dma_b)
+            wait_for(lambda: any(c["class"] == "capture-b" for c in json.loads(command("j/clients"))), "DMA-BUF windows")
+            focus("capture-a")
+
+            def dma_capture(connection, ready=True):
+                capture_id = json.loads(connection.request("screenshot"))["id"]
+                if ready:
+                    def complete():
+                        result = json.loads(connection.request(f"screenshot-status {capture_id}"))
+                        assert result["state"] in ("pending", "ready"), result
+                        return result if result["state"] == "ready" else None
+                    result = wait_for(complete, "DMA-BUF capture")
+                    assert (result["width"], result["height"]) == (320, 240), result
+                    assert connection.request(f"screenshot-read {capture_id} 0 4") == b"data:" + bytes((16, 32, 64, 128))
+                return capture_id
+
+            samples = {"submission_ms": [], "host_input_ms": [], "automation_input_ms": []}
+            with closing(SessionSocket(ipc.parent / ".hyprauto.sock")) as connection:
+                connection.request("set-target class:capture-a")
+                for _ in range(12):
+                    dma_a.request("redraw", "redrawn")
+                    started = time.perf_counter_ns()
+                    capture_id = dma_capture(connection, ready=False)
+                    samples["submission_ms"].append((time.perf_counter_ns() - started) / 1e6)
+                    event_start = len(dma_a.sync())
+                    started = time.perf_counter_ns()
+                    host_click(273, True)
+                    host_click(273, False)
+                    events = dma_a.sync()[event_start:]
+                    samples["host_input_ms"].append((time.perf_counter_ns() - started) / 1e6)
+                    assert "button 273 1" in events and "button 273 0" in events, events
+                    started = time.perf_counter_ns()
+                    assert connection.request("click 40 50 274 0") == b"ok"
+                    events = dma_a.sync()[event_start:]
+                    samples["automation_input_ms"].append((time.perf_counter_ns() - started) / 1e6)
+                    assert "button 274 1" in events and "button 274 0" in events, events
+                    wait_for(lambda: json.loads(connection.request(f"screenshot-status {capture_id}"))["state"] == "ready", "benchmark capture")
+                    connection.request(f"screenshot-release {capture_id}")
+            for line in (logs / "hyprland.log").read_text().splitlines():
+                for label in ("capture-readback-submit-us", "capture-map-copy-us"):
+                    if line.startswith(label + " "):
+                        samples.setdefault(label.removeprefix("capture-").removesuffix("-us") + "_ms", []).append(float(line.split()[1]) / 1000)
+            summary = {}
+            for label, values in samples.items():
+                assert values, label
+                values.sort()
+                summary[label] = {"count": len(values), "p50": values[len(values) // 2], "p95": values[min(len(values) - 1, int(len(values) * 0.95))]}
+            (logs / "capture-performance.json").write_text(json.dumps(summary, indent=2) + "\n")
+            print("Capture performance:", json.dumps(summary), flush=True)
+
+            ok("/eval hl.plugin.test.capture_render(false)")
+            try:
+                def current_buffer(client):
+                    return int(next(e.split()[1] for e in reversed(client.sync()) if e.startswith("buffer-submitted ")))
+
+                def replace_and_release(client, previous):
+                    client.request("redraw", "redrawn")
+                    wait_for(lambda: f"buffer-release {previous}" in client.sync(), f"{client.name} buffer {previous} released without composition", timeout=3)
+
+                with closing(SessionSocket(ipc.parent / ".hyprauto.sock")) as connection:
+                    connection.request("set-target class:capture-a")
+                    previous = current_buffer(dma_a)
+                    capture_id = dma_capture(connection)
+                    connection.request(f"screenshot-release {capture_id}")
+                    replace_and_release(dma_a, previous)
+                    ok("/eval hl.plugin.test.capture_buffers(0)")
+                check("DMA-BUF captures release replaced source buffers without a subsequent composition frame")
+
+                native_result = command("/eval hl.plugin.test.capture_native_sync(true)")
+                assert native_result == "ok" or "native fence sync unavailable" in native_result, native_result
+                native_available = native_result == "ok"
+                if not native_available:
+                    print("SKIP: native fence sync is unavailable; GL fence cleanup is tested", flush=True)
+                for native in ([False, True] if native_available else [False]):
+                    ok(f"/eval hl.plugin.test.capture_native_sync({str(native).lower()})")
+                    for scenario in ("unpolled", "cancel", "end", "disconnect", "switch", "unmap", "destroy"):
+                        connection = SessionSocket(ipc.parent / ".hyprauto.sock")
+                        try:
+                            connection.request("set-target class:capture-a")
+                            previous = current_buffer(dma_a)
+                            if not native:
+                                ok("/eval hl.plugin.test.capture_hold_fences(true)")
+                            capture_id = dma_capture(connection, ready=False)
+                            if scenario == "cancel":
+                                assert connection.request(f"screenshot-release {capture_id}") == b"ok"
+                            elif scenario == "end":
+                                assert connection.request("end") == b"ok"
+                            elif scenario == "disconnect":
+                                connection.close()
+                                command("/hyprauto status")
+                            elif scenario == "switch":
+                                assert connection.request("set-target class:capture-b") == b"ok"
+                            elif scenario == "unmap":
+                                dma_a.request("unmap", "unmapped")
+                            elif scenario == "destroy":
+                                dma_a.close()
+                            if scenario not in ("unmap", "destroy"):
+                                dma_a.request("redraw", "redrawn")
+                                if not native:
+                                    assert f"buffer-release {previous}" not in dma_a.sync(), (scenario, previous)
+                            ok("/eval hl.plugin.test.capture_hold_fences(false)")
+                            if scenario != "destroy":
+                                wait_for(lambda: f"buffer-release {previous}" in dma_a.sync(), f"{scenario} source cleanup", timeout=3)
+                            if scenario in ("unpolled", "cancel"):
+                                if scenario == "unpolled":
+                                    assert connection.request(f"screenshot-release {capture_id}") == b"ok"
+                                try:
+                                    connection.request(f"screenshot-status {capture_id}")
+                                except RuntimeError as exc:
+                                    assert "ID is unavailable" in str(exc), exc
+                                else:
+                                    raise AssertionError("cancelled capture remained accessible")
+                            ok("/eval hl.plugin.test.capture_buffers(0)")
+                        finally:
+                            ok("/eval hl.plugin.test.capture_hold_fences(false)")
+                            connection.close()
+                        if scenario in ("unmap", "destroy"):
+                            dma_a.close()
+                            wait_for(lambda: not any(c["class"] == "capture-a" for c in json.loads(command("j/clients"))), "DMA-BUF target removed")
+                            dma_a = Client("capture-a", dma_env, logs)
+                            clients.append(dma_a)
+                        wait_for(lambda: not any(s["target"] == "capture-a" for s in json.loads(ipc_command("/hyprauto sessions"))), "DMA-BUF ownership released")
+                    check(f"{'native' if native else 'GL'} source cleanup survives no polling, cancellation, end, disconnect, switching, unmap and destruction")
+
+                ok("/eval hl.plugin.test.capture_native_sync(false)")
+                with closing(SessionSocket(ipc.parent / ".hyprauto.sock")) as connection:
+                    connection.request("set-target class:capture-a")
+                    for fence_number, expected in ((1, "cannot track screenshot source buffers"), (2, "cannot submit asynchronous pixel readback")):
+                        previous = current_buffer(dma_a)
+                        ok(f"/eval hl.plugin.test.capture_fence_failure({fence_number})")
+                        try:
+                            connection.request("screenshot")
+                        except RuntimeError as exc:
+                            assert expected in str(exc), exc
+                        else:
+                            raise AssertionError("fence failure accepted")
+                        replace_and_release(dma_a, previous)
+                        capture_id = dma_capture(connection)
+                        connection.request(f"screenshot-release {capture_id}")
+                check("source and readback fence creation failures clean up safely and permit subsequent captures")
+
+                with closing(SessionSocket(ipc.parent / ".hyprauto.sock")) as first, closing(SessionSocket(ipc.parent / ".hyprauto.sock")) as second:
+                    first.request("set-target class:capture-a")
+                    second.request("set-target class:capture-b")
+                    previous_a, previous_b = current_buffer(dma_a), current_buffer(dma_b)
+                    ok("/eval hl.plugin.test.capture_hold_fences(true)")
+                    ok("/eval hl.plugin.test.capture_keep_buffer('capture-b')")
+                    first_id = dma_capture(first, ready=False)
+                    second_id = dma_capture(second, ready=False)
+                    assert first.request(f"screenshot-release {first_id}") == b"ok"
+                    dma_a.request("redraw", "redrawn")
+                    dma_b.request("redraw", "redrawn")
+                    ok("/eval hl.plugin.test.capture_buffers(1)")
+                    ok("/eval hl.plugin.test.capture_hold_fences(false)")
+                    wait_for(lambda: f"buffer-release {previous_a}" in dma_a.sync(), "first session source cleanup")
+                    assert f"buffer-release {previous_b}" not in dma_b.sync()
+                    ok("/eval hl.plugin.test.capture_buffers(1)")
+                    ok("/eval hl.plugin.test.capture_drop_buffers()")
+                    wait_for(lambda: f"buffer-release {previous_b}" in dma_b.sync(), "pre-existing renderer reference released")
+                    wait_for(lambda: json.loads(second.request(f"screenshot-status {second_id}"))["state"] == "ready", "independent DMA-BUF capture")
+                    second.request(f"screenshot-release {second_id}")
+                check("sessions clean up independently and preserve the renderer's pre-existing buffer references")
+
+                connection = SessionSocket(ipc.parent / ".hyprauto.sock")
+                try:
+                    connection.request("set-target class:capture-a")
+                    previous = current_buffer(dma_a)
+                    ok("/eval hl.plugin.test.capture_hold_fences(true)")
+                    dma_capture(connection, ready=False)
+                    dma_a.request("redraw", "redrawn")
+                    assert f"buffer-release {previous}" not in dma_a.sync()
+                    ok(f"/plugin unload {plugin}")
+                    wait_for(lambda: f"buffer-release {previous}" in dma_a.sync(), "unload source cleanup")
+                    ok("/eval hl.plugin.test.capture_hold_fences(false)")
+                    ok(f"/plugin load {plugin}")
+                    with closing(SessionSocket(ipc.parent / ".hyprauto.sock")) as fresh:
+                        fresh.request("set-target class:capture-a")
+                        capture_id = dma_capture(fresh)
+                        fresh.request(f"screenshot-release {capture_id}")
+                finally:
+                    connection.close()
+                check("unload drains pending GPU source references and reload has no stale callbacks")
+            finally:
+                ok("/eval hl.plugin.test.capture_hold_fences(false)")
+                ok("/eval hl.plugin.test.capture_native_sync()")
+                ok("/eval hl.plugin.test.capture_render(true)")
             ok(f"/plugin unload {plugin}")
             assert not Path(service["socket"]).exists()
             print(f"All checks passed. Logs: {logs}", flush=True)

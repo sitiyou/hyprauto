@@ -6,7 +6,10 @@
 #include <cstdio>
 #include <cstdlib>
 #include <stdexcept>
+#include <string>
 #include <string_view>
+#include <GLES3/gl32.h>
+#include <chrono>
 
 static int renderNode() {
     static const int fd = [] {
@@ -38,4 +41,53 @@ int Aquamarine::CHeadlessBackend::drmFD() {
 
 int Aquamarine::CHeadlessBackend::drmRenderNodeFD() {
     return renderNode();
+}
+
+using Clock = std::chrono::steady_clock;
+static Clock::time_point mappedAt;
+
+extern "C" void          glReadPixels(GLint x, GLint y, GLsizei width, GLsizei height, GLenum format, GLenum type, void* data) {
+    static auto original = reinterpret_cast<decltype(&glReadPixels)>(dlsym(RTLD_NEXT, "glReadPixels"));
+    const auto  started  = Clock::now();
+    original(x, y, width, height, format, type, data);
+    if (!data)
+        std::fprintf(stderr, "capture-readback-submit-us %lld\n", static_cast<long long>(std::chrono::duration_cast<std::chrono::microseconds>(Clock::now() - started).count()));
+}
+
+extern "C" void* glMapBufferRange(GLenum target, GLintptr offset, GLsizeiptr length, GLbitfield access) {
+    static auto original = reinterpret_cast<decltype(&glMapBufferRange)>(dlsym(RTLD_NEXT, "glMapBufferRange"));
+    if (target == GL_PIXEL_PACK_BUFFER)
+        mappedAt = Clock::now();
+    return original(target, offset, length, access);
+}
+
+extern "C" GLboolean glUnmapBuffer(GLenum target) {
+    static auto original = reinterpret_cast<decltype(&glUnmapBuffer)>(dlsym(RTLD_NEXT, "glUnmapBuffer"));
+    const auto  result   = original(target);
+    if (target == GL_PIXEL_PACK_BUFFER)
+        std::fprintf(stderr, "capture-map-copy-us %lld\n", static_cast<long long>(std::chrono::duration_cast<std::chrono::microseconds>(Clock::now() - mappedAt).count()));
+    return result;
+}
+
+extern "C" GLenum glClientWaitSync(GLsync sync, GLbitfield flags, GLuint64 timeout) {
+    static auto original = reinterpret_cast<decltype(&glClientWaitSync)>(dlsym(RTLD_NEXT, "glClientWaitSync"));
+    if (std::getenv("HYPRAUTO_TEST_HOLD_FENCES"))
+        return GL_TIMEOUT_EXPIRED;
+    return original(sync, flags, timeout);
+}
+
+extern "C" GLsync glFenceSync(GLenum condition, GLbitfield flags) {
+    static auto original = reinterpret_cast<decltype(&glFenceSync)>(dlsym(RTLD_NEXT, "glFenceSync"));
+    if (const auto count = std::getenv("HYPRAUTO_TEST_FAIL_FENCE")) {
+        const auto remaining = std::atoi(count) - 1;
+        if (!remaining) {
+            unsetenv("HYPRAUTO_TEST_FAIL_FENCE");
+            static auto enable = reinterpret_cast<decltype(&glEnable)>(dlsym(RTLD_NEXT, "glEnable"));
+            enable(0);
+            return nullptr;
+        }
+        const auto value = std::to_string(remaining);
+        setenv("HYPRAUTO_TEST_FAIL_FENCE", value.c_str(), 1);
+    }
+    return original(condition, flags);
 }

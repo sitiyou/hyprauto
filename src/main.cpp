@@ -851,6 +851,7 @@ APICALL EXPORT PLUGIN_DESCRIPTION_INFO PLUGIN_INIT(HANDLE pluginHandle) {
 
 APICALL EXPORT void PLUGIN_EXIT() {
     server.reset();
+    Hyprauto::Capture::shutdown();
     windowClose.reset();
     hostCursorListener.reset();
     pointerFocusListener.reset();
