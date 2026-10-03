@@ -91,7 +91,7 @@ namespace Hyprauto {
             auto&      connection = *static_cast<Connection*>(data);
             auto&      self       = *connection.owner;
             const auto id         = connection.id;
-            if (mask & (WL_EVENT_HANGUP | WL_EVENT_ERROR)) {
+            if ((mask & (WL_EVENT_HANGUP | WL_EVENT_ERROR)) || connection.output.size() > 1048576) {
                 self.disconnect(id);
                 return 0;
             }
@@ -127,14 +127,20 @@ namespace Hyprauto {
                             throw std::runtime_error("Invalid request envelope");
                         const auto requestID = request["id"].get<uint64_t>();
                         const auto command   = request["command"].get<std::string>();
-                        const auto result    = self.dispatch(id, command);
-                        self.reply(connection, requestID, result);
-                        if (!result.starts_with("error:"))
-                            connection.renewed = Clock::now();
-                        std::string operation;
-                        std::istringstream(command) >> operation;
-                        if (operation == "end" && result == "ok")
-                            connection.closing = true;
+                        self.dispatch(id, command, [&self, id, requestID, command](const std::string& result) {
+                            auto it = self.connections.find(id);
+                            if (it == self.connections.end())
+                                return;
+                            auto& client = *it->second;
+                            self.reply(client, requestID, result);
+                            if (!result.starts_with("error:"))
+                                client.renewed = Clock::now();
+                            std::string operation;
+                            std::istringstream(command) >> operation;
+                            if (operation == "end" && result == "ok")
+                                client.closing = true;
+                            wl_event_source_fd_update(client.source, (client.closing ? 0 : WL_EVENT_READABLE) | WL_EVENT_WRITABLE);
+                        });
                     } catch (const std::exception&) {
                         self.disconnect(id);
                         return 0;

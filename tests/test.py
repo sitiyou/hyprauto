@@ -757,12 +757,82 @@ finally:
             assert service["protocol"] == 1 and service["socket"] == str(ipc.parent / ".hyprauto.sock"), service
             assert (Path(service["socket"]).stat().st_mode & 0o777) == 0o600
             focus("host-b")
+            from hyprauto_ctrl import HyprAutoController
+            from unittest.mock import patch
+
+            with patch.dict(os.environ, {"XDG_RUNTIME_DIR": str(runtime)}), HyprAutoController(env["HYPRLAND_INSTANCE_SIGNATURE"]) as controller:
+                assert controller.post_connection("class:target").wait(10).succeeded
+                for duration in (-1, 10001, 1.5):
+                    assert controller.post_click_key(30, duration).failed
+                    assert controller.post_click(40, 50, hold_ms=duration).failed
+                for action, minimum in ((lambda: controller.post_click_key(30), 0.08), (lambda: controller.post_click(40, 50), 0.05)):
+                    start = time.monotonic()
+                    assert action().wait(10).succeeded
+                    assert time.monotonic() - start >= minimum
+                event_start = len(target.sync())
+                jobs = [controller.post_click_key(code, 0) for code in (30, 48, 46)]
+                jobs.append(controller.post_click(40, 50, hold_ms=0))
+                assert all(job.wait(10).succeeded for job in jobs)
+                events = target.sync()[event_start:]
+                keys = [e.split()[1:3] for e in events if e.startswith("key ")]
+                assert keys == [[str(code), str(state)] for code in (30, 48, 46) for state in (1, 0)], events
+                assert "button 272 1" in events and "button 272 0" in events, events
+                assert controller.post_key_down(30).wait(10).succeeded
+                assert controller.post_click_key(30).wait(10).failed
+                assert controller.post_status().wait(10).get()["keys"] == [30]
+                assert controller.post_key_up(30).wait(10).succeeded
+                assert controller.post_touch_down(40, 50).wait(10).succeeded
+                assert controller.post_click(60, 70).wait(10).failed
+                assert controller.post_status().wait(10).get()["position"] == [40, 50]
+                assert controller.post_touch_up().wait(10).succeeded
+                click = controller.post_click_key(30, 100)
+                unmatched = controller.post_key_up(48)
+                followup = controller.post_click(40, 50, hold_ms=0)
+                controller.close()
+                assert click.succeeded and unmatched.failed and followup.succeeded
+                assert controller.session_id is None
+
             first = SessionSocket(Path(service["socket"]))
             second = SessionSocket(Path(service["socket"]))
             try:
                 assert first.session_id != second.session_id
                 assert first.request("set-target class:target") == b"ok"
                 assert second.request("set-target class:host-a") == b"ok"
+
+                def request_async(connection, request):
+                    result = []
+                    def run():
+                        try:
+                            result.append(connection.request(request))
+                        except RuntimeError as exc:
+                            result.append(exc)
+                    thread = threading.Thread(target=run)
+                    thread.start()
+                    return thread, result
+
+                for request, field, code in (("click-key 30 200", "keys", 30), ("click 40 50 272 200", "buttons", 272)):
+                    started = time.monotonic()
+                    thread, result = request_async(first, request)
+                    wait_for(lambda: code in json.loads(first.request("status"))[field], "click held")
+                    assert thread.is_alive()
+                    assert first.request("heartbeat") == b"ok"
+                    assert second.request("click-key 48 0") == b"ok"
+                    try:
+                        first.request("move 60 70")
+                    except RuntimeError:
+                        pass
+                    else:
+                        raise AssertionError("input accepted during click")
+                    thread.join(10)
+                    assert result == [b"ok"] and time.monotonic() - started >= 0.2, result
+                    assert json.loads(first.request("status"))[field] == []
+                for request in ("click-key 30 -1", "click-key 30 10001", "click-key 30 1.5", "click -1 50 272 50", "click 40 50 1 50"):
+                    try:
+                        first.request(request)
+                    except RuntimeError:
+                        pass
+                    else:
+                        raise AssertionError(f"invalid click accepted: {request}")
                 first.request("key 42 down")
                 first.request("key 30 down")
                 first.request("button 272 down")
@@ -816,7 +886,43 @@ finally:
             finally:
                 first.close()
                 second.close()
+            check("timed clicks complete after release, preserve FIFO and held inputs, validate durations and leave other sessions responsive")
             check("multiple sessions isolate input, target ownership, capture and disconnect cleanup; management can revoke a session")
+
+            for cleanup_mode in ("end", "disconnect", "revoke", "unmap"):
+                client = Client("click-target", env, logs)
+                clients.append(client)
+                connection = SessionSocket(Path(service["socket"]))
+                try:
+                    connection.request("set-target class:click-target")
+                    duration = 10000 if cleanup_mode == "end" else 1000
+                    thread, result = request_async(connection, f"click 40 50 272 {duration}")
+                    wait_for(lambda: json.loads(connection.request("status"))["buttons"] == [272], "pending click")
+                    event_start = len(client.sync())
+                    if cleanup_mode == "end":
+                        assert connection.request("end") == b"ok"
+                    elif cleanup_mode == "disconnect":
+                        connection.close()
+                    elif cleanup_mode == "revoke":
+                        assert ipc_command(f"/hyprauto end {connection.session_id}") == b"ok"
+                    else:
+                        client.request("unmap", "unmapped")
+                    thread.join(10)
+                    assert not thread.is_alive() and len(result) == 1 and isinstance(result[0], RuntimeError), result
+                    wait_for(lambda: "button 272 0" in client.sync()[event_start:], "cancelled click released")
+                    if cleanup_mode == "unmap":
+                        assert not json.loads(connection.request("status"))["active"]
+                        connection.request("set-target class:target")
+                        assert connection.request("click-key 30 0") == b"ok"
+                        assert connection.request("button 272 down") == b"ok"
+                        time.sleep(1.05)
+                        state = json.loads(connection.request("status"))
+                        assert state["active"] and state["buttons"] == [272], state
+                        assert connection.request("button 272 up") == b"ok"
+                finally:
+                    connection.close()
+                    client.close()
+            check("end, disconnect, revocation and target unmap cancel pending clicks without stale releases")
 
             crash_start = len(target.sync())
             crash = subprocess.run([sys.executable, "-c", """

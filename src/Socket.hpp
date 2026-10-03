@@ -11,7 +11,8 @@ namespace Hyprauto {
       public:
         using Open     = std::function<void(uint64_t)>;
         using Close    = std::function<void(uint64_t)>;
-        using Dispatch = std::function<std::string(uint64_t, const std::string&)>;
+        using Reply    = std::function<void(const std::string&)>;
+        using Dispatch = std::function<void(uint64_t, const std::string&, Reply)>;
 
         Socket(wl_event_loop* loop, std::string path, Open open, Close close, Dispatch dispatch);
         ~Socket();

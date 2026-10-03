@@ -23,6 +23,7 @@
 #include <nlohmann/json.hpp>
 #include <linux/input-event-codes.h>
 #include <cmath>
+#include <chrono>
 #include <iomanip>
 #include <format>
 #include <set>
@@ -30,6 +31,7 @@
 #include <stdexcept>
 #include <type_traits>
 #include <tuple>
+#include <utility>
 
 using Hyprutils::Utils::CScopeGuard;
 
@@ -88,6 +90,10 @@ struct Session {
     std::string                                    keymap;
     Hyprutils::OS::CFileDescriptor                 keymapFD;
     CHyprSignalListener                            surfaceDestroy;
+    wl_event_source*                               clickTimer = nullptr;
+    Hyprauto::Socket::Reply                         clickReply;
+    std::string                                    clickRelease;
+    std::chrono::steady_clock::time_point           clickDeadline;
 };
 
 static std::map<uint64_t, std::unique_ptr<Session>> sessions;
@@ -326,6 +332,13 @@ static void updateHostRepeatInfo(CWLSeatProtocol* self, uint32_t rate, uint32_t 
 
 static void clearTarget(Session& session, bool restoreHostFocus = true) {
     session.capture->cancel();
+    if (session.clickTimer) {
+        wl_event_source_remove(session.clickTimer);
+        session.clickTimer = nullptr;
+    }
+    auto clickReply = std::exchange(session.clickReply, {});
+    if (clickReply)
+        clickReply("error: click cancelled: target cleared");
     if (!session.client)
         return;
     const bool previousDispatch = automationDispatch;
@@ -542,7 +555,29 @@ static std::string status(const Session& session) {
         .dump();
 }
 
-static std::string dispatchSession(uint64_t id, const std::string& request) {
+static std::string dispatchSession(uint64_t id, const std::string& request, Hyprauto::Socket::Reply reply = {});
+
+static int releaseClick(void* data) {
+    auto& session = *static_cast<Session*>(data);
+    const auto remaining = session.clickDeadline - std::chrono::steady_clock::now();
+    if (remaining > std::chrono::steady_clock::duration::zero()) {
+        const auto delay = std::chrono::ceil<std::chrono::milliseconds>(remaining).count();
+        if (wl_event_source_timer_update(session.clickTimer, delay) == 0)
+            return 0;
+        clearTarget(session);
+        return 0;
+    }
+    wl_event_source_remove(session.clickTimer);
+    session.clickTimer = nullptr;
+    auto reply = std::exchange(session.clickReply, {});
+    const auto result = dispatchSession(session.id, session.clickRelease);
+    if (result.starts_with("error:"))
+        clearTarget(session);
+    reply(result);
+    return 0;
+}
+
+static std::string dispatchSession(uint64_t id, const std::string& request, Hyprauto::Socket::Reply reply) {
     auto&              session = *sessions.at(id);
     std::istringstream input(request);
     std::string        operation;
@@ -556,12 +591,15 @@ static std::string dispatchSession(uint64_t id, const std::string& request) {
         if (operation == "heartbeat")
             return "ok";
     }
+    const bool previousDispatch = automationDispatch;
     automationDispatch = true;
-    CScopeGuard restore([] { automationDispatch = false; });
+    CScopeGuard restore([previousDispatch] { automationDispatch = previousDispatch; });
     if (operation == "end") {
         clearTarget(session);
         return "ok";
     }
+    if (session.clickReply)
+        return "error: click in progress";
     if (operation == "set-target") {
         std::string selector, extra;
         if (!(input >> selector) || input >> extra)
@@ -599,6 +637,47 @@ static std::string dispatchSession(uint64_t id, const std::string& request) {
             return "error: block-input requires on/off";
         session.blockInput = mode == "on";
         return "ok";
+    }
+    if (operation == "click" || operation == "click-key") {
+        int code, hold;
+        double x = 0, y = 0;
+        std::string extra;
+        if ((operation == "click" && !(input >> x >> y)) || !(input >> code >> hold) || input >> extra || hold < 0 || hold > 10000 ||
+            (operation == "click-key" ? code < 1 || code > KEY_MAX : code < BTN_MOUSE || code >= BTN_JOYSTICK))
+            return "error: expected valid click arguments and hold duration 0..10000 ms";
+        if ((operation == "click-key" ? session.keys : session.buttons).contains(code))
+            return "error: unpaired input state";
+        if (!reply)
+            return "error: click requires asynchronous reply";
+        auto timer = wl_event_loop_add_timer(wl_display_get_event_loop(g_pCompositor->m_wlDisplay), releaseClick, &session);
+        if (!timer)
+            return "error: cannot create click timer";
+        const auto operationName = operation == "click-key" ? "key " : "button ";
+        std::string result = "ok";
+        if (operation == "click")
+            result = dispatchSession(id, std::format("move {} {}", x, y));
+        if (result == "ok")
+            result = dispatchSession(id, std::format("{}{} down", operationName, code));
+        if (result != "ok") {
+            wl_event_source_remove(timer);
+            return result;
+        }
+        session.clickRelease = std::format("{}{} up", operationName, code);
+        if (hold == 0) {
+            wl_event_source_remove(timer);
+            result = dispatchSession(id, session.clickRelease);
+            if (result.starts_with("error:"))
+                clearTarget(session);
+            return result;
+        }
+        session.clickTimer = timer;
+        session.clickDeadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(hold);
+        if (wl_event_source_timer_update(timer, hold) != 0) {
+            clearTarget(session);
+            return "error: cannot arm click timer";
+        }
+        session.clickReply = std::move(reply);
+        return {};
     }
     if (operation == "key" || operation == "button") {
         int         code;
@@ -761,7 +840,11 @@ APICALL EXPORT PLUGIN_DESCRIPTION_INFO PLUGIN_INIT(HANDLE pluginHandle) {
                 sessions.erase(it);
             }
         },
-        dispatchSession);
+        [](uint64_t id, const std::string& request, Hyprauto::Socket::Reply reply) {
+            auto result = dispatchSession(id, request, reply);
+            if (!result.empty())
+                reply(result);
+        });
     Log::logger->log(Log::DEBUG, "[hyprauto] plugin initialized; pointer focus and set_cursor tracing enabled");
     return {"hyprauto", "Independent background Wayland input sessions", "hyprauto contributors", HYPRAUTO_VERSION};
 }

@@ -42,7 +42,11 @@ Pass `instance="instance-signature"` at construction when selecting a particular
 
 `post_connection()` creates a session, optionally selecting a target. `set_target(selector)` switches only that controller's target. Select a mapped native Wayland window with bound keyboard and pointer resources, using selectors such as `class:target` or `address:0x...`. Selecting an unavailable or occupied target fails without changing the existing target or held input. Selecting the current target again does not reset it.
 
-Jobs expose `succeeded` and `error`; always check them when handling failures. `post_click_key(key, hold_ms=50)` uses Linux evdev key codes and holds the key for 50 ms by default. For example, `42` is left Shift and `30` is A. Mouse contacts `0`, `1` and `2` mean left, right and middle button. Coordinates are relative to the target's main surface and must remain inside it.
+Jobs expose `succeeded` and `error`; always check them when handling failures. Jobs execute in submission order within each controller; separate controllers remain independent. Click jobs finish after release is sent, not after the application responds.
+
+`post_click_key(key, hold_ms=80)` uses Linux evdev key codes and holds the key for at least 80 ms by default. For example, `42` is left Shift and `30` is A. `post_click(x, y, contact=0, pressure=1, hold_ms=50)` holds the mouse button for at least 50 ms by default. Mouse contacts `0`, `1` and `2` mean left, right and middle button. Coordinates are relative to the target's main surface and must remain inside it.
+
+Both click methods accept integer hold durations from 0 to 10000 ms; zero requests immediate release and may be missed by applications that sample input per frame. Clicking an already-held key or button fails without releasing it. For longer holds, use explicit down/up methods.
 
 ### Cleanup and connection failures
 

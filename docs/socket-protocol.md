@@ -35,7 +35,7 @@ Clients then send JSON requests with a nonzero unsigned 64-bit request ID and a 
 {"id":2,"command":"move 40 50"}
 ```
 
-IDs should be unique for the connection lifetime. Heartbeats and operations can be outstanding at the same time. Commands execute on the compositor event loop in receive order; the client must match responses by ID.
+IDs should be unique for the connection lifetime. Heartbeats and operations can be outstanding at the same time. Commands start on the compositor event loop in receive order; timed clicks defer completion, so replies can arrive out of order. The client must match responses by ID.
 
 A successful control response contains a string result:
 
@@ -69,6 +69,8 @@ Output is nonblocking and buffered. Clients must continue reading responses; a q
 | `key <code> down\|up` | `ok`; press or release a Linux evdev key code. |
 | `move <x> <y>` | `ok`; move the automation pointer within the main-surface bounds. |
 | `button <code> down\|up` | `ok`; press or release a Linux evdev mouse button code. |
+| `click <x> <y> <button-code> <hold-ms>` | Move, press and release an evdev mouse button; reply `ok` after release. |
+| `click-key <key-code> <hold-ms>` | Press and release an evdev key; reply `ok` after release. |
 | `block-input on\|off` | `ok`; block or allow host input to the bound client. |
 | `screenshot [path]` | JSON string containing a capture `id`. An optional double-quoted path selects PNG output; omit it for retained raw pixels. |
 | `screenshot-status <capture-id>` | JSON string with `state`: `pending`, `ready` or `failed`. A failed state includes `error`. A ready state includes `width`, `height`, `format`, `size` and `path`. |
@@ -77,6 +79,8 @@ Output is nonblocking and buffered. Clients must continue reading responses; a q
 | `end` | `ok`, then disconnect and destroy the session. |
 
 All commands except `heartbeat`, `status`, `set-target` and `end` require a target. Duplicate presses, unmatched releases and invalid arguments are rejected. Command tokens are whitespace-separated; a selector is one token. Screenshot paths support double quoting and backslash escaping through C++ `std::quoted` syntax.
+
+Click hold durations must be integers from 0 to 10000 ms. Zero releases immediately; positive durations are minimum holds and may finish later if the compositor is busy. A click rejects an already-held key or button without changing it. While a click is pending, only `status`, `heartbeat` and `end` are accepted; other commands return an error rather than being queued. Clients requiring ordered actions must wait for completion before sending the next action. Target loss or session cleanup cancels the pending click and releases held input; target loss leaves the connection usable. Successful replies indicate input was sent, not that the application acted on it.
 
 Each successful command renews the 30-second lease, including `status`. Errors and incomplete frames do not renew it. Send `heartbeat` every five seconds even when idle or waiting for a screenshot; do not serialize heartbeats behind long-running application actions. The expiry timer runs every second, so cleanup occurs on the first timer tick after expiry. A client paused longer than the lease must create a new connection.
 

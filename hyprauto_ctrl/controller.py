@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import os
+import queue
 import threading
 import time
 from contextlib import suppress
@@ -73,6 +74,8 @@ class HyprAutoController:
         self.target: str | None = None
         self.instance = instance
         self._lock = threading.Lock()
+        self._actions: queue.Queue = queue.Queue()
+        self._worker: threading.Thread | None = None
         self._connected = False
         self._connection: SessionSocket | None = None
         self._cached_image: np.ndarray | None = None
@@ -88,16 +91,25 @@ class HyprAutoController:
     def _submit(self, action, result: bool = False) -> Job:
         job = JobWithResult() if result else Job._pending()
 
-        def run() -> None:
+        with self._lock:
+            self._actions.put((action, job))
+            if self._worker is None:
+                self._worker = threading.Thread(target=self._run_actions, daemon=True)
+                self._worker.start()
+        return job
+
+    def _run_actions(self) -> None:
+        while True:
+            with self._lock:
+                try:
+                    action, job = self._actions.get_nowait()
+                except queue.Empty:
+                    self._worker = None
+                    return
             try:
-                with self._lock:
-                    value = action()
-                job._finish(value)
+                job._finish(action())
             except Exception as exc:
                 job._finish(error=str(exc))
-
-        threading.Thread(target=run, daemon=True).start()
-        return job
 
     def post_connection(self, target: str | None = None) -> Job:
         def connect() -> str:
@@ -135,17 +147,14 @@ class HyprAutoController:
 
         return self._submit(select)
 
-    def post_click(self, x: int, y: int, contact: int = 0, pressure: int = 1) -> Job:
+    def post_click(self, x: int, y: int, contact: int = 0, pressure: int = 1, hold_ms: int = 50) -> Job:
         button = {0: 272, 1: 273, 2: 274}.get(contact)
         if button is None:
             return Job(error="only mouse contacts 0 (left), 1 (right), and 2 (middle) are supported")
 
-        def click() -> str:
-            self._command("move", str(x), str(y))
-            self._command("button", str(button), "down")
-            return self._command("button", str(button), "up")
-
-        return self._submit(click)
+        if not isinstance(hold_ms, int) or not 0 <= hold_ms <= 10000:
+            return Job(error="hold duration must be an integer between 0 and 10000 ms")
+        return self._submit(lambda: self._command("click", str(x), str(y), str(button), str(hold_ms)))
 
     def post_key_down(self, key: int) -> Job:
         return self._submit(lambda: self._command("key", str(key), "down"))
@@ -154,15 +163,9 @@ class HyprAutoController:
         return self._submit(lambda: self._command("key", str(key), "up"))
 
     def post_click_key(self, key: int, hold_ms: int = 80) -> Job:
-        if hold_ms < 0:
-            return Job(error="hold duration must not be negative")
-
-        def click() -> str:
-            self._command("key", str(key), "down")
-            time.sleep(hold_ms / 1000)
-            return self._command("key", str(key), "up")
-
-        return self._submit(click)
+        if not isinstance(hold_ms, int) or not 0 <= hold_ms <= 10000:
+            return Job(error="hold duration must be an integer between 0 and 10000 ms")
+        return self._submit(lambda: self._command("click-key", str(key), str(hold_ms)))
 
     def post_touch_down(self, x: int, y: int, contact: int = 0, pressure: int = 1) -> Job:
         button = {0: 272, 1: 273, 2: 274}.get(contact)
@@ -254,7 +257,7 @@ class HyprAutoController:
         self.close()
 
     def close(self) -> None:
-        with self._lock:
+        def disconnect() -> str:
             if self._connection is not None:
                 try:
                     self._command("end")
@@ -265,3 +268,6 @@ class HyprAutoController:
                     self._connection = None
             self._connected = False
             self.target = None
+            return "ok"
+
+        self._submit(disconnect).wait()
